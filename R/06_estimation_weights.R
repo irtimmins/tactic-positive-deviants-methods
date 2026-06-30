@@ -48,7 +48,7 @@ run_standardise <- function(d, cont, bin, lambda = lambda_main, uplim = NULL,
   else mean(predict(pm, newdata = target_data))
   
   site <- site_summary(d) %>%
-    left_join(distinct(d, hosp, diag_hosp), by = "hosp")
+    left_join(distinct(d, hosp, diag_hosp = diag_hosp_canon), by = "hosp")
   list(d = d, site = site, std_out = std_out, model = pm)
 }
 
@@ -105,7 +105,7 @@ imp_bin <- setdiff(bin_primary, "yr_late")
 
 half_n <- df %>% count(hosp, period) %>%
   tidyr::pivot_wider(names_from = period, values_from = n, values_fill = 0)
-ok_hosp <- half_n %>% filter(first > min_volume / 2, second > min_volume / 2) %>% pull(hosp)
+ok_hosp <- half_n %>% filter(first >= min_per_year, second >= min_per_year) %>% pull(hosp)
 
 base_dat <- filter(df, period == "first",  hosp %in% ok_hosp)
 late_dat <- filter(df, period == "second", hosp %in% ok_hosp)

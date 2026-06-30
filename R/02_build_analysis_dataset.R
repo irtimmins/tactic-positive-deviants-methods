@@ -1,11 +1,11 @@
-# 02  build the analysis dataset
+# 02  build the analysis dataset (clinical eligibility)
 # -----------------------------------------------------------------------------
-# Draws the analysis sample and a flowchart that starts from all colon (C18)
-# adults diagnosed in the window, then excludes stage 4 / non-elective / DCO /
-# diagnosed-at-death / later primaries to reach the eligible cohort, then joins
-# the built cohort for the surgical and decision-to-treat steps and the volume
-# threshold. The top of the funnel comes from the registry file (one row per
-# tumour, with inclusion flags); the bottom comes from the built cohort.
+# Draws the analysis sample through the clinical funnel: all colon (C18) adults
+# diagnosed in the window, then stage 4 / non-elective / DCO / diagnosed-at-death
+# / later primaries removed to the eligible cohort, then the surgical and
+# decision-to-treat requirements. Hospital codes are left raw here; provider
+# identity and volume are handled in 04, after the crosswalks are built in 03.
+# Writes the clinical analysis set and the top of the flowchart.
 
 library(dplyr)
 library(lubridate)
@@ -15,9 +15,19 @@ source("R/01_config.R")
 reg    <- readRDS(registry_rds)   # all C18 adults 2015+, inclusion flags
 cohort <- readRDS(in_rds)         # eligible cohort + surgery + CWT + covariates
 
-flow <- tibble(step = character(), n = integer(), n_hosp = integer())
-add  <- function(label, n, n_hosp = NA_integer_)
-  flow <<- bind_rows(flow, tibble(step = label, n = n, n_hosp = n_hosp))
+flow <- tibble(box = integer(), kind = character(), label = character(),
+               n = integer(), n_hosp = integer())
+.prev <- NA_integer_
+fc_box <- function(box, label, n, n_hosp = NA_integer_) {
+  flow  <<- bind_rows(flow, tibble(box = box, kind = "box", label = label,
+                                   n = as.integer(n), n_hosp = as.integer(n_hosp)))
+  .prev <<- as.integer(n)
+}
+fc_excl <- function(box, reason, n_after) {
+  flow  <<- bind_rows(flow, tibble(box = box, kind = "exclusion", label = reason,
+                                   n = .prev - as.integer(n_after), n_hosp = NA_integer_))
+  .prev <<- as.integer(n_after)
+}
 
 # analysis window ------------------------------------------------------------
 end_date   <- if (is.na(window_end)) max(reg$diagmdy, na.rm = TRUE) else as.Date(window_end)
@@ -25,57 +35,47 @@ start_date <- end_date %m-% months(window_months) %m+% days(1)
 cat(sprintf("window: %s to %s\n", start_date, end_date))
 
 w  <- reg %>% filter(diagmdy >= start_date, diagmdy <= end_date)
-np <- function(mask) n_distinct(w$pseudo_patientid[mask])   # distinct patients
+np <- function(mask) n_distinct(w$pseudo_patientid[mask])
 
-# registry funnel: all C18 adults in window -> eligible cohort ---------------
-add(sprintf("All colon (C18) adults diagnosed in window (%s to %s)", start_date, end_date),
-    n_distinct(w$pseudo_patientid))
-m <- w$incl_stage13;            add("Stage 1-3 (excl stage 4 / X / U)", np(m))
-m <- m & w$incl_elective_route; add("Elective / known route to diagnosis", np(m))
-m <- m & w$incl_not_dco;        add("Excl death-certificate-only", np(m))
-m <- m & w$incl_not_diag_death; add("Excl diagnosed at death", np(m))
-m <- m & w$is_first_primary;    add("First primary (eligible cohort)", np(m))
+# box 1: all colon adults in the window -------------------------------------
+fc_box(1, "All colon (C18) adults diagnosed in window", n_distinct(w$pseudo_patientid))
+
+# box 2: stage 1-3 -----------------------------------------------------------
+m <- w$incl_stage13
+fc_excl(2, "Stage 4 / unknown / unstaged", np(m))
+fc_box(2, "Stage 1-3", np(m))
+
+# box 3: eligible incident colon cancer --------------------------------------
+m <- m & w$incl_elective_route; fc_excl(3, "Non-elective / unknown route to diagnosis", np(m))
+m <- m & w$incl_not_dco;        fc_excl(3, "Death-certificate-only diagnosis", np(m))
+m <- m & w$incl_not_diag_death; fc_excl(3, "Diagnosed at death", np(m))
+m <- m & w$is_first_primary;    fc_excl(3, "Not the first primary tumour", np(m))
+fc_box(3, "Eligible incident colon cancer", np(m))
 
 elig_ids <- unique(w$pseudo_patientid[m])
 
-# join the eligible in-window patients to the built cohort for surgery, CWT and
-# covariates (one row per patient). Sizes should match the eligible count above.
+# join eligible in-window patients to the built cohort for surgery / CWT / covars
 df <- cohort %>% filter(pseudo_patientid %in% elig_ids)
 if (nrow(df) != length(elig_ids))
   cat(sprintf("note: %d eligible patients, %d matched in the built cohort\n",
               length(elig_ids), nrow(df)))
 
-# treatment requirement ------------------------------------------------------
-df <- df %>% filter(had_surgery)
-add("Underwent a colon resection", nrow(df), n_distinct(df$diag_hosp))
-df <- df %>% filter(!emergency)
-add("Elective resection (non-emergency admission)", nrow(df), n_distinct(df$diag_hosp))
-df <- df %>% filter(dtt_valid)
-add("Valid decision-to-treat (clock node)", nrow(df), n_distinct(df$diag_hosp))
+# box 4: underwent an elective colon resection -------------------------------
+df <- df %>% filter(had_surgery, !emergency)
+fc_excl(4, "No elective colon resection", nrow(df))
+fc_box(4, "Underwent elective colon resection", nrow(df), n_distinct(df$diag_hosp))
 
-# outcome plausibility -------------------------------------------------------
-# valid DTT already guarantees a non-negative wait; this bounds the upper tail
-# and (optionally) removes exact zero-day waits, which can be genuine same-day
-# fast-track activity - left as the drop_zero_wait toggle.
+# box 5: valid, plausible waiting time ---------------------------------------
+df <- df %>% filter(dtt_valid)
+fc_excl(5, "No valid decision-to-treat recorded", nrow(df))
 df$wait <- df[[outcome_var]]
 df <- df %>% filter(wait <= max_wait)
-add(sprintf("Wait <= %d days", max_wait), nrow(df), n_distinct(df$diag_hosp))
+fc_excl(5, sprintf("Wait > %d days", max_wait), nrow(df))
 if (drop_zero_wait) {
   df <- df %>% filter(wait > 0)
-  add("Wait > 0 days", nrow(df), n_distinct(df$diag_hosp))
+  fc_excl(5, "Wait <= 0 days", nrow(df))
 }
-
-# hospital identity ----------------------------------------------------------
-# resolve recorded codes to canonical hospitals (identity unless a crosswalk is
-# supplied), then optionally keep only a curated list of hospitals.
-xwalk <- load_provider_xwalk()
-df <- df %>% mutate(diag_hosp = trimws(as.character(diag_hosp)),
-                    diag_hosp_canon = canonicalise_hosp(diag_hosp, xwalk))
-if (file.exists(provider_include_csv)) {
-  inc <- read.csv(provider_include_csv, colClasses = "character")$canonical_code
-  df  <- df %>% filter(diag_hosp_canon %in% trimws(inc))
-  add("Included hospitals (curated list)", nrow(df), n_distinct(df$diag_hosp_canon))
-}
+fc_box(5, "Valid waiting time (DTT recorded, plausible wait)", nrow(df), n_distinct(df$diag_hosp))
 
 # covariates -----------------------------------------------------------------
 # sex is the raw NCRAS coding (1/2); assumed 1 = male, 2 = female - confirm.
@@ -138,26 +138,9 @@ df <- df %>%
 
 df <- df %>% mutate(across(c(imd_2, imd_3, imd_4, imd_5), ~ ifelse(is.na(.), 0L, .)))
 
-# volume threshold on the analysis unit (canonical hospital) -----------------
-vol <- df %>% count(diag_hosp_canon, name = "volume")
-df  <- df %>% left_join(vol, by = "diag_hosp_canon") %>%
-  filter(volume > min_volume)
-add(sprintf("Hospital volume > %d in window", min_volume),
-    nrow(df), n_distinct(df$diag_hosp_canon))
+cat("\nflowchart (boxes and exclusions):\n"); print(as.data.frame(flow))
+cat(sprintf("\nclinically eligible: %d patients, %d raw diagnosing codes\n",
+            nrow(df), n_distinct(df$diag_hosp)))
 
-# numeric hospital id for the estimation step (contiguous after the filters)
-df <- df %>% mutate(hospid = as.integer(factor(diag_hosp_canon)), hosp = hospid)
-
-hosp_lookup <- df %>%
-  distinct(hospid, diag_hosp_canon, diag_hosp, diag_hosp_name, canalliance, volume) %>%
-  arrange(hospid)
-
-cat("\nflowchart:\n"); print(as.data.frame(flow))
-cat(sprintf("\nanalysis sample: %d patients, %d hospitals\n",
-            nrow(df), n_distinct(df$diag_hosp_canon)))
-cat(sprintf("median wait %.0f days (IQR %.0f-%.0f)\n",
-            median(df$wait), quantile(df$wait, .25), quantile(df$wait, .75)))
-
-saveRDS(df,          file.path(out_dir, "analysis_data.rds"))
-saveRDS(hosp_lookup, file.path(out_dir, "hosp_lookup.rds"))
-write.csv(as.data.frame(flow), file.path(out_dir, "analysis_flowchart.csv"), row.names = FALSE)
+saveRDS(df, clinical_rds)
+write.csv(as.data.frame(flow), flow_clinical_csv, row.names = FALSE)

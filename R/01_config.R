@@ -23,6 +23,8 @@ base_dir <- "D:/Projects/#2045_ICON_TACTIC/Project1_interim_bowel/tactic-bowel-q
 in_rds   <- file.path(base_dir, "colon_cohort_cwt_2015_2022.rds")  # eligible cohort + surgery + CWT
 registry_rds <- file.path(base_dir, "colon_registry_2015_2022.rds")  # all C18 adults + inclusion flags
 out_dir  <- "Output"      # all analysis outputs are written here
+clinical_rds <- file.path(out_dir, "analysis_clinical.rds")  # 02 -> 04 hand-off
+flow_clinical_csv <- file.path(out_dir, "flow_clinical.csv")
 stan_dir <- "R"           # folder holding the Stan model file
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
@@ -32,26 +34,34 @@ if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 window_months <- 24
 window_end    <- NA       # NA = latest diagnosis date; or e.g. as.Date("2022-12-31")
 
-# minimum number of patients a hospital needs over the window to be included.
-# 24 months at >= 10 patients/year corresponds to about 20; the default of 30 is
-# stricter, for more stable hospital estimates.
-min_volume <- 0
+# inclusion volume: a site must have at least min_per_year patients in EVERY
+# calendar year of the window. Applied in 04 to both the diagnosing unit and the
+# treating site, and to each half-window in the improvement estimand (06).
+min_per_year <- 10
+
+# single-colon-site detection in 03 (calibrate with qc_calibrate_colon_site.R).
+# A trust code is mapped to one 5-digit site only when colon activity clearly
+# concentrates there: a site needs site_min_vol patients to count as real, and one
+# site must hold dominance_share of the trust's site-coded colon volume.
+site_min_vol    <- 20
+dominance_share <- 0.95
 
 # outcome --------------------------------------------------------------------
 outcome_var    <- "wt_dx_to_dtt"   # days from diagnosis to decision-to-treat
 max_wait       <- 180              # exclude waits longer than this as implausible
 drop_zero_wait <- TRUE             # exclude exact zero-day waits (see note in 02)
 
-# hospital identity (optional) -----------------------------------------------
-# the build leaves diagnosing-hospital codes as recorded (a mix of 3- and 5-char
-# ODS codes, with mergers and surgical-hub coding). Supply a curated crosswalk to
-# resolve these to one canonical hospital before counting volumes and ranking.
-# Absent file -> codes are used as recorded. Applied in 02.
-provider_xwalk_csv   <- file.path(base_dir, "provider_crosswalk.csv")   # raw_code, canonical_code, canonical_name
-# optional curated list of hospitals to keep (e.g. confirmed bowel-resection
-# providers), one canonical_code per row in a column named canonical_code.
-# Absent file -> keep every hospital that meets the volume threshold.
-provider_include_csv <- file.path(base_dir, "provider_include.csv")
+# provider QC (built by 03, applied by 04) ----------------------------------
+# 03 reconciles the cohort codes, the curated site Excel and the ODS API into
+# canonical 5-digit diagnosing and treating sites. 04 reads these to canonicalise
+# and to keep only valid providers. Curate the crosswalks once, then rerun 04.
+qc_dir          <- file.path(out_dir, "provider_qc")
+site_xlsx       <- file.path("Data/Site_level", "NHSHospitals_services_5.3.26_with_colours.xlsx")
+diag_xwalk_csv  <- file.path(qc_dir, "diag_crosswalk.csv")    # raw_code, canonical_code, canonical_name
+treat_xwalk_csv <- file.path(qc_dir, "treat_crosswalk.csv")
+diag_include_csv  <- file.path(qc_dir, "diag_include.csv")    # canonical_code (valid diagnosing sites)
+treat_include_csv <- file.path(qc_dir, "treat_include.csv")  # canonical_code (bowel-surgery sites)
+if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 
 # covariates to adjust for ---------------------------------------------------
 # continuous covariates (entered as standardised values in the weighting step)
