@@ -6,7 +6,7 @@
 library(dplyr)
 library(lubridate)
 
-source("00_config_funcs.R")
+source("R/00_config_funcs.R")
 
 df <- readRDS(in_rds)
 

@@ -8,10 +8,10 @@
 
 # paths ---------------------------------------------------------------------
 # edit these two for your machine
-base_dir <- "E:/Data_PHE/Extracts/#2045_ICON_TACTIC/Derived"
-in_rds   <- file.path(base_dir, "colon_cohort_cci_2015_2022.rds")
-out_dir  <- file.path(base_dir, "positive_deviance")
-stan_dir <- out_dir                       # where the .stan files live
+base_dir <- "D:/Projects/#2045_ICON_TACTIC/Project1_interim_bowel/tactic-bowel-quantifying-variation/Data/ICON"
+in_rds   <- file.path(base_dir, "colon_cohort_cWT_2015_2022.rds")
+out_dir  <- file.path("Output")
+stan_dir <- file.path("R")                     # where the .stan files live
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 # analysis window -----------------------------------------------------------
@@ -72,15 +72,47 @@ make_std_matrix <- function(df, cont, bin) {
   cbind(Xc, Xb)
 }
 
+# reference moments (means, sds, proportions) of a target population, used when
+# standardising one group to a different population than its own.
+ref_moments <- function(df, cont, bin) {
+  list(cont_mean = sapply(df[cont], mean),
+       cont_sd   = sapply(df[cont], sd),
+       bin_p     = sapply(df[bin],  mean))
+}
+
+# standardised balance matrix using externally supplied reference moments, so a
+# zero target balances each group to that reference population rather than to
+# its own means. continuous: (x - ref_mean) / ref_sd; binary: (x - ref_p) scaled
+# by the floored reference proportion.
+make_std_matrix_ref <- function(df, cont, bin, ref) {
+  Xc <- mapply(function(v, m, s) (df[[v]] - m) / s,
+               cont, ref$cont_mean[cont], ref$cont_sd[cont])
+  ctr <- ref$bin_p[bin]
+  scl <- sqrt(pmax(ctr, 0.05) * (1 - pmax(ctr, 0.05)))
+  Xb <- mapply(function(v, c0, s) (df[[v]] - c0) / s, bin, ctr, scl)
+  out <- cbind(Xc, Xb)
+  colnames(out) <- c(cont, bin)
+  out
+}
+
 # pull the per-patient weight out of a balancer standardize() result.
 # weights come back as a patients-by-hospitals matrix with the weight sitting in
 # the patient's own hospital column, so the row max recovers it.
 extract_weights <- function(std_out) apply(std_out$weights, 1, max)
 
-# weighted quantile (used for standardised medians)
+# weighted quantile (used for standardised medians). robust to small or
+# degenerate cells: ignores zero-weight rows, returns the single value when a
+# group has no spread, and collapses tied cumulative weights before interpolating.
 w_quantile <- function(x, w, p = 0.5) {
+  ok <- is.finite(x) & is.finite(w) & w > 0
+  x <- x[ok]; w <- w[ok]
+  if (length(x) == 0) return(NA_real_)
+  if (length(unique(x)) == 1) return(x[1])
   o <- order(x); x <- x[o]; w <- w[o]
   cw <- cumsum(w) / sum(w)
+  dup <- duplicated(cw, fromLast = TRUE)
+  cw <- cw[!dup]; x <- x[!dup]
+  if (length(x) < 2) return(x[length(x)])
   approx(cw, x, xout = p, rule = 2, ties = "ordered")$y
 }
 

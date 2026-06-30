@@ -12,17 +12,26 @@
 library(balancer)
 library(dplyr)
 
-source("00_config_funcs.R")
+source("R/00_config_funcs.R")
 df <- readRDS(file.path(out_dir, "analysis_data.rds"))
 
 # reweight one data frame to its own population means and summarise by hospital.
 # cont/bin are the balance covariates; the prognostic model uses the same set.
-run_standardise <- function(d, cont, bin, lambda = lambda_main, uplim = NULL) {
+run_standardise <- function(d, cont, bin, lambda = lambda_main, uplim = NULL,
+                            ref = NULL, target_data = NULL) {
   d <- d %>% arrange(hosp)
-  X    <- make_std_matrix(d, cont, bin)
-  Z    <- d$hosp
-  tgt0 <- rep(0, ncol(X))
-  args <- list(X = X, target = tgt0, Z = Z, lambda = lambda, exact_global = FALSE)
+  if (is.null(ref)) ref <- ref_moments(d, cont, bin)
+  X <- make_std_matrix_ref(d, cont, bin, ref)
+  
+  # drop covariates that are constant within d: they carry no balancing
+  # information and would divide by zero (e.g. a within-period indicator after
+  # the data have been split by period).
+  keep <- apply(X, 2, function(col) { s <- sd(col); is.finite(s) && s > 0 })
+  X <- X[, keep, drop = FALSE]
+  
+  Z <- d$hosp
+  args <- list(X = X, target = rep(0, ncol(X)), Z = Z,
+               lambda = lambda, exact_global = FALSE)
   if (!is.null(uplim)) args$uplim <- uplim
   std_out <- do.call(standardize, args)
   d$w <- extract_weights(std_out)
@@ -31,8 +40,12 @@ run_standardise <- function(d, cont, bin, lambda = lambda_main, uplim = NULL) {
   # pooled prognostic model on the raw covariates for residual balancing
   form <- as.formula(paste("wait ~", paste(c(cont, bin), collapse = " + ")))
   pm <- lm(form, data = d)
-  d$resid     <- resid(pm)
-  d$canonical <- mean(fitted(pm))   # constant for a pooled model (= grand mean)
+  d$resid <- resid(pm)
+  # model prediction averaged over the target population (defaults to d itself);
+  # for the later improvement period this is the baseline population so the
+  # augmented estimate also targets the baseline case-mix.
+  d$canonical <- if (is.null(target_data)) mean(fitted(pm))
+  else mean(predict(pm, newdata = target_data))
   
   site <- site_summary(d) %>%
     left_join(distinct(d, hosp, diag_hosp), by = "hosp")
@@ -82,17 +95,26 @@ saveRDS(fit_full,    file.path(out_dir, "fit_full.rds"))
 saveRDS(site_sustained, file.path(out_dir, "site_sustained.rds"))
 
 # improvement estimand -------------------------------------------------------
-# standardise each half of the window to the same (whole-window) target by
-# reusing the population means; the difference is the change in standardised
-# performance. hospitals need enough volume in both halves.
+# baseline period = first half of the window (year N); later period = second
+# half. both are standardised to the SAME reference: the covariate distribution
+# of the baseline period. each hospital's later-period wait is therefore what it
+# would be if its later patients had the baseline case-mix, and the difference
+# is change in performance net of case-mix drift. the within-period indicator is
+# dropped from the balance set because it is constant once we split by period.
+imp_bin <- setdiff(bin_primary, "yr_late")
+
 half_n <- df %>% count(hosp, period) %>%
   tidyr::pivot_wider(names_from = period, values_from = n, values_fill = 0)
 ok_hosp <- half_n %>% filter(first > min_volume / 2, second > min_volume / 2) %>% pull(hosp)
 
-site_p1 <- run_standardise(filter(df, period == "first",  hosp %in% ok_hosp),
-                           cont_vars, bin_primary, lambda_main)$site
-site_p2 <- run_standardise(filter(df, period == "second", hosp %in% ok_hosp),
-                           cont_vars, bin_primary, lambda_main)$site
+base_dat <- filter(df, period == "first",  hosp %in% ok_hosp)
+late_dat <- filter(df, period == "second", hosp %in% ok_hosp)
+ref_base <- ref_moments(base_dat, cont_vars, imp_bin)   # the fixed target
+
+site_p1 <- run_standardise(base_dat, cont_vars, imp_bin, lambda_main,
+                           ref = ref_base, target_data = base_dat)$site
+site_p2 <- run_standardise(late_dat, cont_vars, imp_bin, lambda_main,
+                           ref = ref_base, target_data = base_dat)$site
 
 site_improve <- site_p1 %>%
   select(hosp, diag_hosp, stand1 = stand_adj, se1 = se_adj_pool, n1 = n) %>%
@@ -112,6 +134,3 @@ for (st in levels(df$cci_strata)) {
   saveRDS(fit_st$site,
           file.path(out_dir, sprintf("site_strata_%s.rds", gsub("[^0-9a-zA-Z]", "", st))))
 }
-
-cat("\nstandardisation done. sustained hospitals:", nrow(site_sustained),
-    "| improvement hospitals:", nrow(site_improve), "\n")

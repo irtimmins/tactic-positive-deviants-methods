@@ -8,7 +8,7 @@ library(rstan)
 library(dplyr)
 library(ggplot2)
 
-source("00_config_funcs.R")
+source("R/00_config_funcs.R")
 
 # optional: a diag_hosp code to highlight in the caterpillar plots
 highlight_hosp <- NA
@@ -99,3 +99,4 @@ symbols(c(4, 6), c(3, 3), circles = c(2, 2), inches = FALSE, add = TRUE)
 text(3, 3, n_s); text(7, 3, n_i); text(5, 3, n_b)
 text(3, 5.4, "Sustained"); text(7, 5.4, "Improved")
 dev.off()
+
