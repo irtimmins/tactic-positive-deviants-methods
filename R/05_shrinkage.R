@@ -6,7 +6,7 @@
 library(rstan)
 library(dplyr)
 
-source("R/00_config_funcs.R")
+source("R/01_config.R")
 options(mc.cores = parallel::detectCores())
 rstan_options(auto_write = TRUE)
 

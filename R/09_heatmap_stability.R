@@ -8,7 +8,7 @@ library(dplyr)
 library(lubridate)
 library(ggplot2)
 
-source("00_config_funcs.R")
+source("R/01_config.R")
 df <- readRDS(file.path(out_dir, "analysis_data.rds"))
 
 # six-month period index within the window

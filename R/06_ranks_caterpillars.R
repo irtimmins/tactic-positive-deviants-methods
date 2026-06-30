@@ -8,7 +8,7 @@ library(rstan)
 library(dplyr)
 library(ggplot2)
 
-source("R/00_config_funcs.R")
+source("R/01_config.R")
 
 # optional: a diag_hosp code to highlight in the caterpillar plots
 highlight_hosp <- NA

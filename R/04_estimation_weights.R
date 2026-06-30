@@ -12,7 +12,7 @@
 library(balancer)
 library(dplyr)
 
-source("R/00_config_funcs.R")
+source("R/01_config.R")
 df <- readRDS(file.path(out_dir, "analysis_data.rds"))
 
 # reweight one data frame to its own population means and summarise by hospital.

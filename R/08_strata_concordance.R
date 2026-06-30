@@ -13,7 +13,7 @@ library(rstan)
 library(dplyr)
 library(ggplot2)
 
-source("R/00_config_funcs.R")
+source("R/01_config.R")
 prob_cut <- 0.80   # candidate threshold, matching 05
 
 process_fit <- function(obj) {
