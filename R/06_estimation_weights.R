@@ -11,6 +11,7 @@
 
 library(balancer)
 library(dplyr)
+library(ggplot2)
 
 source("R/01_config.R")
 df <- readRDS(file.path(out_dir, "analysis_data.rds"))
@@ -81,40 +82,59 @@ balance_tradeoff <- function(d, cont, bin, grid = lambda_grid) {
   as.data.frame(res)
 }
 
-# sustained estimand (whole window) ------------------------------------------
-trade <- balance_tradeoff(df, cont_vars, bin_primary)
+# main analysis: case-mix (age + cci) standardisation ------------------------
+# NB the main model deliberately excludes season and calendar year (they are a
+# sensitivity analysis, script 12) and all other patient factors.
+cv    <- code_covariates(df)
+trade <- balance_tradeoff(cv$data, cv$cont, cv$bin)
 cat("balance vs effective n by lambda:\n"); print(round(trade, 3))
 write.csv(trade, file.path(out_dir, "lambda_tradeoff.csv"), row.names = FALSE)
 
-fit_primary <- run_standardise(df, cont_vars, bin_primary, lambda_main)
-fit_full    <- run_standardise(df, cont_vars, bin_full,    lambda_main)
+# bias-variance trade-off curve (after Keele et al). Each point is one lambda:
+# how much case-mix imbalance the weights remove (percent bias reduced) against
+# the average effective sample size they keep. Small lambda sits top-left (most
+# bias removed, fewest effective patients); larger lambda moves down and right.
+# The elbow is the practical sweet spot; the working value lambda_main is marked.
+trade_curve <- trade %>%
+  mutate(pct_bias_removed = 100 * bias_removed,
+         is_main = abs(lambda - lambda_main) < 1e-9)
 
-site_sustained <- fit_primary$site
-saveRDS(fit_primary, file.path(out_dir, "fit_primary.rds"))
-saveRDS(fit_full,    file.path(out_dir, "fit_full.rds"))
+p_trade <- ggplot(trade_curve, aes(mean_eff_n, pct_bias_removed)) +
+  geom_path(colour = "grey60") +
+  geom_point(aes(colour = is_main), size = 2) +
+  geom_text(aes(label = lambda), vjust = -0.8, size = 2.8) +
+  scale_colour_manual(values = c(`FALSE` = "black", `TRUE` = "firebrick"),
+                      guide = "none") +
+  labs(x = "Average effective sample size per hospital",
+       y = "Case-mix bias removed (%)",
+       title = "Bias reduction against effective sample size across lambda",
+       subtitle = "each point is a lambda value; the working value is highlighted") +
+  theme_bw()
+
+ggsave(file.path(out_dir, "lambda_tradeoff.pdf"), p_trade, width = 7, height = 5)
+
+fit_main <- run_standardise(cv$data, cv$cont, cv$bin, lambda_main)
+site_sustained <- fit_main$site
+saveRDS(fit_main,       file.path(out_dir, "fit_primary.rds"))
 saveRDS(site_sustained, file.path(out_dir, "site_sustained.rds"))
 
 # improvement estimand -------------------------------------------------------
-# baseline period = first half of the window (year N); later period = second
-# half. both are standardised to the SAME reference: the covariate distribution
-# of the baseline period. each hospital's later-period wait is therefore what it
-# would be if its later patients had the baseline case-mix, and the difference
-# is change in performance net of case-mix drift. the within-period indicator is
-# dropped from the balance set because it is constant once we split by period.
-imp_bin <- setdiff(bin_primary, "yr_late")
-
+# baseline period = first half of the window; later period = second half. Both
+# are standardised to the SAME reference: the case-mix of the baseline period.
+# The period split is the design here, so calendar terms are not covariates.
 half_n <- df %>% count(hosp, period) %>%
   tidyr::pivot_wider(names_from = period, values_from = n, values_fill = 0)
 ok_hosp <- half_n %>% filter(first >= min_per_year, second >= min_per_year) %>% pull(hosp)
 
 base_dat <- filter(df, period == "first",  hosp %in% ok_hosp)
 late_dat <- filter(df, period == "second", hosp %in% ok_hosp)
-ref_base <- ref_moments(base_dat, cont_vars, imp_bin)   # the fixed target
+cvb <- code_covariates(base_dat); cvl <- code_covariates(late_dat)
+ref_base <- ref_moments(cvb$data, cvb$cont, cvb$bin)    # the fixed target
 
-site_p1 <- run_standardise(base_dat, cont_vars, imp_bin, lambda_main,
-                           ref = ref_base, target_data = base_dat)$site
-site_p2 <- run_standardise(late_dat, cont_vars, imp_bin, lambda_main,
-                           ref = ref_base, target_data = base_dat)$site
+site_p1 <- run_standardise(cvb$data, cvb$cont, cvb$bin, lambda_main,
+                           ref = ref_base, target_data = cvb$data)$site
+site_p2 <- run_standardise(cvl$data, cvl$cont, cvl$bin, lambda_main,
+                           ref = ref_base, target_data = cvb$data)$site
 
 site_improve <- site_p1 %>%
   select(hosp, diag_hosp, stand1 = stand_adj, se1 = se_adj_pool, n1 = n) %>%
@@ -125,12 +145,11 @@ site_improve <- site_p1 %>%
 saveRDS(site_improve, file.path(out_dir, "site_improve.rds"))
 
 # comorbidity strata ---------------------------------------------------------
-# within a stratum comorbidity is near-constant, so balance on age and calendar
-# terms only and standardise to the stratum population.
-strata_cont <- "agediag"
+# within a stratum comorbidity is near-constant, so adjust for age only and
+# standardise to the stratum population.
 for (st in levels(df$cci_strata)) {
-  fit_st <- run_standardise(filter(df, cci_strata == st),
-                            strata_cont, bin_primary, lambda_main)
+  cvs <- code_covariates(filter(df, cci_strata == st), cci = "none")
+  fit_st <- run_standardise(cvs$data, cvs$cont, cvs$bin, lambda_main)
   saveRDS(fit_st$site,
           file.path(out_dir, sprintf("site_strata_%s.rds", gsub("[^0-9a-zA-Z]", "", st))))
 }

@@ -28,5 +28,5 @@ step("08_ranks_caterpillars.R")         # posterior ranks, caterpillars, candida
 step("09_method_comparison.R")          # ranking-method comparison + funnel plots
 step("10_strata_concordance.R")         # consistency across comorbidity strata
 step("11_heatmap_stability.R")          # stability over six-month periods
-
+step("12_sensitivity_covariates.R")
 message("\nAnalysis complete. Outputs in Output/.")

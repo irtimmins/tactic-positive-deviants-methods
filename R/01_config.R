@@ -63,19 +63,58 @@ diag_include_csv  <- file.path(qc_dir, "diag_include.csv")    # canonical_code (
 treat_include_csv <- file.path(qc_dir, "treat_include.csv")  # canonical_code (bowel-surgery sites)
 if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 
-# covariates to adjust for ---------------------------------------------------
-# continuous covariates (entered as standardised values in the weighting step)
-cont_vars <- c("agediag", "cci_n_conditions")
+# case-mix adjustment --------------------------------------------------------
+# The main analysis adjusts for two clinical factors only: age at diagnosis and
+# comorbidity (Charlson). No other patient factors (sex, ethnicity, deprivation,
+# stage) are adjusted for. Season and calendar year are held OUT of the main
+# model and enter only in the time sensitivity analysis (script 12).
+#
+# Coding of age and cci is set here and explored in explore_covariate_coding.R.
+#   age_coding : "cont" linear age, or "band" (<50 / 50-59 / 60-69 / 70-79 / 80+)
+#   cci_coding : "cont" linear Charlson count, "0_1_2plus", "0_1_2_3plus", or "none"
+age_coding <- "cont"
+cci_coding <- "cont"
 
-# binary covariates, built as 0/1 indicators in 02. The "primary" set adjusts for
-# age band, comorbidity, calendar period and season; the "full" set also adjusts
-# for sex, ethnicity, deprivation and stage.
-bin_primary <- c("yr_late", "q2", "q3", "q4")
-bin_full    <- c(bin_primary,
-                 "male",
-                 "eth_asian", "eth_black", "eth_mixed", "eth_other", "eth_unknown",
-                 "imd_2", "imd_3", "imd_4", "imd_5",
-                 "stage_2", "stage_3")
+# season (quarter) and calendar-period indicators, added ONLY in the time
+# sensitivity analysis, never in the main model
+time_bin <- c("q2", "q3", "q4", "yr_late")
+
+# build the case-mix covariates for a given coding: returns the (augmented) data
+# and the continuous / binary covariate names to hand to the weighting step.
+# reference categories are 60-69 for age bands and 0 conditions for cci.
+#
+# To add a patient factor to the MAIN model, append its column name(s) to cont
+# (continuous, mean-balanced) or bin (0/1 dummies, proportion-balanced) below.
+# The dummy columns already exist in the data from 02, so it is a one-liner, e.g.
+#   bin <- c(bin, "male")                    # add sex
+#   bin <- c(bin, "stage_2", "stage_3")      # add stage (reference = stage 1)
+# Stage and sex are deliberately excluded here; add them only if you decide they
+# are confounders you want removed rather than part of the pathway.
+code_covariates <- function(d, age = age_coding, cci = cci_coding) {
+  cont <- character(0); bin <- character(0)
+  if (age == "cont") {
+    cont <- c(cont, "agediag")
+  } else if (age == "band") {
+    b <- cut(d$agediag, c(-Inf, 50, 60, 70, 80, Inf),
+             labels = c("u50", "50_59", "60_69", "70_79", "80p"))
+    for (lv in c("u50", "50_59", "70_79", "80p")) {
+      col <- paste0("age_", lv); d[[col]] <- as.integer(b == lv); bin <- c(bin, col)
+    }
+  }
+  if (cci == "cont") {
+    cont <- c(cont, "cci_n_conditions")
+  } else if (cci == "0_1_2plus") {
+    d$cci_1  <- as.integer(d$cci_n_conditions == 1)
+    d$cci_2p <- as.integer(d$cci_n_conditions >= 2)
+    bin <- c(bin, "cci_1", "cci_2p")
+  } else if (cci == "0_1_2_3plus") {
+    d$cci_1  <- as.integer(d$cci_n_conditions == 1)
+    d$cci_2  <- as.integer(d$cci_n_conditions == 2)
+    d$cci_3p <- as.integer(d$cci_n_conditions >= 3)
+    bin <- c(bin, "cci_1", "cci_2", "cci_3p")
+  }
+  list(data = d, cont = cont, bin = bin)
+}
 
 # case-mix balance strictness (balancing-weights method) ---------------------
 # lambda controls how hard the weights push for an exact match to the overall
@@ -95,94 +134,116 @@ prior_tau_scale <- 10
 # ============================================================================
 # PART B  -  helper functions (no need to edit)
 # ============================================================================
+# Shared building blocks used across the analysis scripts. Each is written to be
+# read straight through and checked by hand.
 
-# standardise a continuous covariate to mean 0, sd 1
+# --- standardising covariates -----------------------------------------------
+# The weighting step needs every covariate on a comparable scale. A continuous
+# covariate is centred on its mean and scaled by its sd; a 0/1 covariate is
+# centred on its proportion and scaled by its binomial sd.
+
+# a continuous covariate, shifted to mean 0 and scaled to sd 1
 z_std <- function(x) (x - mean(x)) / sd(x)
 
-# centre and scale a 0/1 covariate, with a floor so very rare categories do not
-# dominate the balance
+# a 0/1 covariate, centred on its proportion p and scaled by sqrt(p(1-p)). The
+# 0.05 floor applies to the scale only, so a very rare category is not blown up
+# enough to swamp the balance; the centre stays the true proportion.
 bin_std <- function(x) {
-  p <- mean(x)
-  if (p < 0.05) p <- 0.05
-  (x - mean(x)) / sqrt(p * (1 - p))
+  p     <- mean(x)
+  scale <- sqrt(max(p, 0.05) * (1 - max(p, 0.05)))
+  (x - p) / scale
 }
 
-# build the standardised covariate matrix from a data frame
+# build the standardised covariate matrix: take the covariate columns, z-score
+# each continuous one, centre/scale each binary one, and return a numeric matrix
+# with one column per covariate. code_covariates() always includes at least age,
+# so c(cont, bin) is never empty.
 make_std_matrix <- function(df, cont, bin) {
-  Xc <- sapply(df[cont], z_std)
-  Xb <- sapply(df[bin],  bin_std)
-  cbind(Xc, Xb)
+  std <- df[c(cont, bin)]                       # the covariate columns, in order
+  for (v in cont) std[[v]] <- z_std(df[[v]])
+  for (v in bin)  std[[v]] <- bin_std(df[[v]])
+  as.matrix(std)
 }
 
-# means / sds / proportions of a target population, used when standardising one
-# group to a different population than its own (e.g. the improvement analysis)
+# the mean and sd of each continuous covariate, and the proportion of each binary
+# one, in a chosen reference population. Used when a group is standardised to a
+# different population than its own (e.g. baseline vs later period in 06).
 ref_moments <- function(df, cont, bin) {
-  list(cont_mean = sapply(df[cont], mean),
-       cont_sd   = sapply(df[cont], sd),
-       bin_p     = sapply(df[bin],  mean))
+  cont_mean <- numeric(0); cont_sd <- numeric(0); bin_p <- numeric(0)
+  for (v in cont) {
+    cont_mean[v] <- mean(df[[v]])
+    cont_sd[v]   <- sd(df[[v]])
+  }
+  for (v in bin) bin_p[v] <- mean(df[[v]])
+  list(cont_mean = cont_mean, cont_sd = cont_sd, bin_p = bin_p)
 }
 
-# standardised covariate matrix using externally supplied reference moments, so
-# a zero target balances each group to that reference population rather than to
-# its own means
+# the same standardised matrix as make_std_matrix, but centred and scaled to
+# externally supplied reference moments rather than the group's own values. A
+# zero balance target then pulls each group towards that reference population.
 make_std_matrix_ref <- function(df, cont, bin, ref) {
-  Xc <- mapply(function(v, m, s) (df[[v]] - m) / s,
-               cont, ref$cont_mean[cont], ref$cont_sd[cont])
-  ctr <- ref$bin_p[bin]
-  scl <- sqrt(pmax(ctr, 0.05) * (1 - pmax(ctr, 0.05)))
-  Xb <- mapply(function(v, c0, s) (df[[v]] - c0) / s, bin, ctr, scl)
-  out <- cbind(Xc, Xb)
-  colnames(out) <- c(cont, bin)
-  out
+  std <- df[c(cont, bin)]
+  for (v in cont) {
+    std[[v]] <- (df[[v]] - ref$cont_mean[v]) / ref$cont_sd[v]
+  }
+  for (v in bin) {
+    p        <- ref$bin_p[v]
+    scale    <- sqrt(max(p, 0.05) * (1 - max(p, 0.05)))
+    std[[v]] <- (df[[v]] - p) / scale
+  }
+  as.matrix(std)
 }
 
-# pull the per-patient weight out of a balancer standardize() result (the weight
-# sits in the patient's own hospital column, so the row max recovers it)
+# pull the per-patient weight out of a balancer standardize() result. Each
+# patient's weight sits in the column for their own hospital, so the row maximum
+# recovers it.
 extract_weights <- function(std_out) apply(std_out$weights, 1, max)
 
-# weighted quantile (used for standardised medians); robust to small/degenerate
-# cells: ignores zero-weight rows, returns the single value when there is no
-# spread, and collapses tied cumulative weights before interpolating
+# weighted quantile, used for standardised medians. Written to be robust in small
+# or degenerate cells: drop zero-weight rows, return the single value when there
+# is no spread, and collapse tied cumulative weights before interpolating.
 w_quantile <- function(x, w, p = 0.5) {
   ok <- is.finite(x) & is.finite(w) & w > 0
-  x <- x[ok]; w <- w[ok]
+  x  <- x[ok]; w <- w[ok]
   if (length(x) == 0) return(NA_real_)
   if (length(unique(x)) == 1) return(x[1])
-  o <- order(x); x <- x[o]; w <- w[o]
-  cw <- cumsum(w) / sum(w)
-  dup <- duplicated(cw, fromLast = TRUE)
-  cw <- cw[!dup]; x <- x[!dup]
+  o  <- order(x); x <- x[o]; w <- w[o]
+  cum_w <- cumsum(w) / sum(w)
+  keep  <- !duplicated(cum_w, fromLast = TRUE)
+  cum_w <- cum_w[keep]; x <- x[keep]
   if (length(x) < 2) return(x[length(x)])
-  approx(cw, x, xout = p, rule = 2, ties = "ordered")$y
+  approx(cum_w, x, xout = p, rule = 2, ties = "ordered")$y
 }
 
 # per-hospital standardised summaries for a continuous outcome.
 # df needs: hosp (id), y (outcome), w (weight), resid (outcome-model residual),
 # canonical (population-mean model prediction). Returns one row per hospital with
-# the weighted and regression-adjusted estimates, effective sample size and
-# pooled standard errors.
+# the weighted and regression-adjusted estimates, effective sample size and both
+# per-hospital and pooled standard errors.
 site_summary <- function(df) {
   library(dplyr)
   s <- df %>%
     group_by(hosp) %>%
     summarise(
       n          = n(),
-      n_eff      = sum(w)^2 / sum(w^2),
+      n_eff      = sum(w)^2 / sum(w^2),                 # effective sample size
       raw_mean   = mean(y),
       raw_median = median(y),
-      stand      = weighted.mean(y, w),
-      stand_med  = w_quantile(y, w, 0.5),
-      stand_adj  = weighted.mean(resid, w) + mean(canonical),
+      stand      = weighted.mean(y, w),                 # standardised mean
+      stand_med  = w_quantile(y, w, 0.5),               # standardised median
+      stand_adj  = weighted.mean(resid, w) + mean(canonical),   # augmented mean
       sd_w       = sqrt(sum(w^2 * (y - weighted.mean(y, w))^2) / sum(w^2)),
       sd_adj     = sqrt(sum(w^2 * resid^2) / sum(w^2)),
       .groups = "drop"
     )
+  # pool the within-hospital spread across hospitals (weighted by effective n),
+  # giving a more stable SE for small hospitals than each one's own sd
   sd_pool     <- sqrt(weighted.mean(s$sd_w^2,   s$n_eff))
   sd_pool_adj <- sqrt(weighted.mean(s$sd_adj^2, s$n_eff))
   s %>% mutate(
-    se          = sd_w   / sqrt(n_eff),
-    se_pool     = sd_pool / sqrt(n_eff),
-    se_adj      = sd_adj / sqrt(n_eff),
+    se          = sd_w        / sqrt(n_eff),
+    se_pool     = sd_pool     / sqrt(n_eff),
+    se_adj      = sd_adj      / sqrt(n_eff),
     se_adj_pool = sd_pool_adj / sqrt(n_eff),
     sd_pool     = sd_pool,
     sd_pool_adj = sd_pool_adj
@@ -190,18 +251,20 @@ site_summary <- function(df) {
 }
 
 # posterior ranking metrics from a draws-by-hospital matrix of latent means.
-# shorter wait is better, so rank 1 is the best performer.
+# shorter wait is better, so rank 1 is the best performer. For each posterior
+# draw we rank the hospitals, then summarise each hospital's rank across draws.
 rank_metrics <- function(draws, tops = c(.05, .10, .20, .50)) {
   J <- ncol(draws)
-  R <- t(apply(draws, 1, rank, ties.method = "average"))   # draws x J
+  ranks <- t(apply(draws, 1, rank, ties.method = "average"))   # draws x hospitals
   out <- data.frame(
-    exp_rank = colMeans(R),
-    rank_lo  = apply(R, 2, quantile, 0.025),
-    rank_hi  = apply(R, 2, quantile, 0.975)
+    exp_rank = colMeans(ranks),                    # posterior mean rank
+    rank_lo  = apply(ranks, 2, quantile, 0.025),   # 95% credible interval
+    rank_hi  = apply(ranks, 2, quantile, 0.975)
   )
+  # probability each hospital sits in the fastest p% of the ranking
   for (p in tops) {
-    thr <- ceiling(p * J)
-    out[[paste0("p_top", p * 100)]] <- colMeans(R <= thr)
+    threshold <- ceiling(p * J)
+    out[[paste0("p_top", p * 100)]] <- colMeans(ranks <= threshold)
   }
   out
 }
@@ -217,13 +280,16 @@ load_provider_xwalk <- function(path = provider_xwalk_csv) {
                       canonical_name = character()))
   }
   x <- read.csv(path, colClasses = "character", stringsAsFactors = FALSE)
-  data.frame(lapply(x, trimws), stringsAsFactors = FALSE)
+  for (v in names(x)) x[[v]] <- trimws(x[[v]])       # tidy stray whitespace
+  x
 }
 
+# apply the crosswalk: look each recorded code up in the table and return its
+# canonical code, keeping the original code where there is no match.
 canonicalise_hosp <- function(codes, xwalk) {
   raw <- trimws(toupper(as.character(codes)))
   if (is.null(xwalk) || nrow(xwalk) == 0) return(raw)
-  m   <- setNames(xwalk$canonical_code, toupper(xwalk$raw_code))
-  out <- unname(m[raw])
-  ifelse(is.na(out), raw, out)
+  lookup <- setNames(xwalk$canonical_code, toupper(xwalk$raw_code))
+  mapped <- lookup[raw]                              # canonical code, or NA
+  ifelse(is.na(mapped), raw, unname(mapped))
 }

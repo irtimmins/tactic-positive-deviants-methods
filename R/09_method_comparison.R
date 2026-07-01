@@ -4,7 +4,7 @@
 # sustained estimand (the basis for Table 3), and draws funnel plots. Methods:
 #   - raw mean and median (no adjustment)
 #   - balancing-weights direct standardisation, mean and median, on the age +
-#     comorbidity set and on the full patient mix
+#     comorbidity case-mix (the main model)
 #   - regression direct standardisation (fixed hospital effects, g-computation)
 #   - regression direct standardisation with shrinkage (random hospital effects
 #     via a linear mixed model, g-computed over the patient mix) - the regression
@@ -19,8 +19,11 @@ library(lme4)
 source("R/01_config.R")
 df    <- readRDS(file.path(out_dir, "analysis_data.rds"))
 fit_p <- readRDS(file.path(out_dir, "fit_primary.rds"))
-fit_f <- readRDS(file.path(out_dir, "fit_full.rds"))
 sus   <- read.csv(file.path(out_dir, "ranks_sustained.csv"))
+
+cv   <- code_covariates(df)          # the main model case-mix (age + cci)
+df   <- cv$data
+cont <- cv$cont; bin <- cv$bin
 
 # regression direct standardisation (fixed hospital effects): fit hospital as a
 # fixed effect, predict every hospital over the whole patient mix, and average.
@@ -32,8 +35,7 @@ reg_std <- function(d, cont, bin) {
   vapply(hs, function(h) { nd <- d; nd$hospf <- factor(h, levels = hs); mean(predict(m, nd)) },
          numeric(1))
 }
-g_primary <- reg_std(df, cont_vars, bin_primary)
-g_full    <- reg_std(df, cont_vars, bin_full)
+g_reg <- reg_std(df, cont, bin)
 
 # regression direct standardisation with shrinkage: hospital as a random effect.
 # The g-computation average over the whole patient mix equals the population
@@ -50,12 +52,11 @@ reg_std_shrunk <- function(d, cont, bin) {
   hs <- levels(d$hospf)
   setNames(pop_fixed + re[hs], hs)
 }
-g_shrunk_primary <- reg_std_shrunk(df, cont_vars, bin_primary)
-g_shrunk_full    <- reg_std_shrunk(df, cont_vars, bin_full)
+g_shrunk <- reg_std_shrunk(df, cont, bin)
 
 # indirect standardisation: expected wait from a pooled model on each hospital's
 # own patients, then observed - expected + grand mean.
-pm <- lm(as.formula(paste("wait ~", paste(c(cont_vars, bin_primary), collapse = " + "))),
+pm <- lm(as.formula(paste("wait ~", paste(c(cont, bin), collapse = " + "))),
          data = df)
 df$pred <- predict(pm)
 grand   <- mean(df$wait)
@@ -67,20 +68,15 @@ ind <- df %>% group_by(hosp) %>%
 comp <- fit_p$site %>%
   transmute(hosp, diag_hosp,
             raw_mean, raw_median,
-            wt_ac_mean = stand, wt_ac_med = stand_med) %>%
-  left_join(fit_f$site %>% transmute(hosp, wt_full_mean = stand, wt_full_med = stand_med),
-            by = "hosp") %>%
-  left_join(tibble(hosp = as.integer(names(g_primary)),        reg_ac        = g_primary),        by = "hosp") %>%
-  left_join(tibble(hosp = as.integer(names(g_full)),           reg_full      = g_full),           by = "hosp") %>%
-  left_join(tibble(hosp = as.integer(names(g_shrunk_primary)), reg_shrunk_ac = g_shrunk_primary), by = "hosp") %>%
-  left_join(tibble(hosp = as.integer(names(g_shrunk_full)),    reg_shrunk_full = g_shrunk_full),  by = "hosp") %>%
+            wt_mean = stand, wt_med = stand_med) %>%
+  left_join(tibble(hosp = as.integer(names(g_reg)),    reg        = g_reg),    by = "hosp") %>%
+  left_join(tibble(hosp = as.integer(names(g_shrunk)), reg_shrunk = g_shrunk), by = "hosp") %>%
   left_join(ind %>% select(hosp, indirect), by = "hosp") %>%
   left_join(sus %>% select(hosp, shrunk_rank = exp_rank), by = "hosp")
 
 # turn each estimate into a rank (1 = fastest); shrunk_rank is already a rank
-methods <- c("raw_mean","raw_median","wt_ac_mean","wt_ac_med",
-             "wt_full_mean","wt_full_med","reg_ac","reg_full",
-             "reg_shrunk_ac","reg_shrunk_full","indirect")
+methods <- c("raw_mean", "raw_median", "wt_mean", "wt_med",
+             "reg", "reg_shrunk", "indirect")
 ranks <- comp %>%
   mutate(across(all_of(methods), ~ rank(.x, ties.method = "average"),
                 .names = "rank_{.col}")) %>%
