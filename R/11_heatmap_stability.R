@@ -17,22 +17,23 @@ df <- df %>%
   mutate(bin = floor(as.numeric(interval(start_date, diagmdy), "months") / 6) + 1,
          bin = factor(bin, labels = paste0("H", sort(unique(bin)))))
 
-# pooled prognostic model for expected wait
-pm <- lm(as.formula(paste("wait ~", paste(c(cont_vars, bin_primary), collapse = " + "))),
+# pooled prognostic model for expected wait (main case-mix: age + cci)
+cv <- code_covariates(df); df <- cv$data
+pm <- lm(as.formula(paste("wait ~", paste(c(cv$cont, cv$bin), collapse = " + "))),
          data = df)
 df$pred <- predict(pm)
 grand <- mean(df$wait)
 
 cell <- df %>%
-  group_by(hosp, diag_hosp, bin) %>%
+  group_by(hosp, diag_hosp_canon, bin) %>%
   summarise(n = n(), std = mean(wait) - mean(pred) + grand, .groups = "drop") %>%
   filter(n >= 10)                       # suppress very small cells
 
-order_by <- cell %>% group_by(diag_hosp) %>%
+order_by <- cell %>% group_by(diag_hosp_canon) %>%
   summarise(overall = mean(std), .groups = "drop") %>% arrange(overall)
-cell <- cell %>% mutate(diag_hosp = factor(diag_hosp, levels = order_by$diag_hosp))
+cell <- cell %>% mutate(diag_hosp_canon = factor(diag_hosp_canon, levels = order_by$diag_hosp_canon))
 
-p <- ggplot(cell, aes(bin, diag_hosp, fill = std)) +
+p <- ggplot(cell, aes(bin, diag_hosp_canon, fill = std)) +
   geom_tile() +
   scale_fill_gradient2(midpoint = grand, low = "#2c7bb6", mid = "#ffffbf",
                        high = "#d7191c", name = "Std. days") +

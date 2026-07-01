@@ -26,6 +26,7 @@ out_dir  <- "Output"      # all analysis outputs are written here
 clinical_rds <- file.path(out_dir, "analysis_clinical.rds")  # 02 -> 04 hand-off
 flow_clinical_csv <- file.path(out_dir, "flow_clinical.csv")
 stan_dir <- "R"           # folder holding the Stan model file
+stan_file <- file.path(stan_dir, "dp_normal_cont.stan")   # the normal-normal shrinkage model
 if (!dir.exists(out_dir)) dir.create(out_dir, recursive = TRUE)
 
 # analysis window ------------------------------------------------------------
@@ -72,8 +73,14 @@ if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 # Coding of age and cci is set here and explored in explore_covariate_coding.R.
 #   age_coding : "cont" linear age, or "band" (<50 / 50-59 / 60-69 / 70-79 / 80+)
 #   cci_coding : "cont" linear Charlson count, "0_1_2plus", "0_1_2_3plus", or "none"
+#
+# cci_coding is set to "0_1_2plus": it matches how Charlson comorbidity burden is
+# naturally described (0, 1, 2+ conditions), and explore_covariate_coding.R shows
+# hospital rankings are essentially unchanged across every coding tested (rank
+# Spearman >= 0.99 vs continuous), so the natural coding is preferred over the
+# marginally higher effective sample size of the continuous term.
 age_coding <- "cont"
-cci_coding <- "cont"
+cci_coding <- "0_1_2plus"
 
 # season (quarter) and calendar-period indicators, added ONLY in the time
 # sensitivity analysis, never in the main model
@@ -253,7 +260,7 @@ site_summary <- function(df) {
 # posterior ranking metrics from a draws-by-hospital matrix of latent means.
 # shorter wait is better, so rank 1 is the best performer. For each posterior
 # draw we rank the hospitals, then summarise each hospital's rank across draws.
-rank_metrics <- function(draws, tops = c(.05, .10, .20, .50)) {
+rank_metrics <- function(draws, tops = c(.05, .10, .20, .25, .50)) {
   J <- ncol(draws)
   ranks <- t(apply(draws, 1, rank, ties.method = "average"))   # draws x hospitals
   out <- data.frame(
@@ -267,6 +274,39 @@ rank_metrics <- function(draws, tops = c(.05, .10, .20, .50)) {
     out[[paste0("p_top", p * 100)]] <- colMeans(ranks <= threshold)
   }
   out
+}
+
+# --- Bayesian shrinkage (the one routine used everywhere) --------------------
+# The normal-normal shrinkage model. Feed it per-hospital point estimates y and
+# their standard errors se, and it pulls each hospital towards the overall mean
+# by an amount set by its precision. This is the single shrinkage step in the
+# analysis: whatever the point estimates are (weighted-standardised means, raw
+# means, a change score), they are shrunk the same way, by this function. rstan
+# must be loaded by the calling script.
+fit_shrink <- function(y, se, mu_mean = mean(y),
+                       mu_sd = prior_mu_sd, tau_scale = prior_tau_scale,
+                       seed = 8675309, refresh = 2000, cores = 1,
+                       adapt_delta = 0.95) {
+  dat <- list(J = length(y), y_site_obs = y, sigma_site_obs = se,
+              prior_mu_mean = mu_mean, prior_mu_sd = mu_sd,
+              prior_tau_scale = tau_scale)
+  # cores = 1 keeps sampling in the main process so the per-iteration progress
+  # prints to the console; on Windows parallel workers hide it. these models are
+  # tiny so sequential chains cost nothing. raise cores for speed if you do not
+  # need the live progress. adapt_delta above the 0.8 default takes smaller steps
+  # to suppress divergences in low-signal fits (e.g. the high-comorbidity stratum).
+  rstan::stan(stan_file, data = dat, seed = seed,
+              chains = 4, iter = 4000, warmup = 2000, refresh = refresh, cores = cores,
+              control = list(adapt_delta = adapt_delta, max_treedepth = 12))
+}
+
+# shrink a set of point estimates and return the shrunk posterior mean and the
+# posterior mean rank (1 = fastest). A thin wrapper over fit_shrink for callers
+# that only need the shrunk estimate and its rank, in the input hospital order.
+stan_shrink_rank <- function(y, se, mu_mean = mean(y)) {
+  fit   <- fit_shrink(y, se, mu_mean = mu_mean)
+  draws <- rstan::extract(fit, pars = "y_site_true")$y_site_true   # draws x hospitals
+  data.frame(post_mean = colMeans(draws), exp_rank = rank_metrics(draws)$exp_rank)
 }
 
 # resolve recorded hospital codes to canonical hospitals using the optional
@@ -292,4 +332,47 @@ canonicalise_hosp <- function(codes, xwalk) {
   lookup <- setNames(xwalk$canonical_code, toupper(xwalk$raw_code))
   mapped <- lookup[raw]                              # canonical code, or NA
   ifelse(is.na(mapped), raw, unname(mapped))
+}
+
+# --- hospital display names -------------------------------------------------
+# Shared name tidying, used wherever hospital names are shown (08, 09). Title
+# Case a name with small joining words left lower-case (except the first word)
+# and NHS kept upper-case; apply manual corrections; and drop any trailing
+# "(code)" since the site code has its own column.
+name_small_words <- c("and", "of", "the", "for", "in", "on", "at", "to", "by", "an", "a", "or")
+name_acronyms    <- c("nhs")
+title_case <- function(x) {
+  vapply(x, function(one) {
+    words <- strsplit(tolower(one), " ")[[1]]
+    for (i in seq_along(words)) {
+      if (words[i] %in% name_acronyms) {
+        words[i] <- toupper(words[i])
+      } else if (!(words[i] %in% name_small_words) || i == 1) {
+        substr(words[i], 1, 1) <- toupper(substr(words[i], 1, 1))
+      }
+    }
+    paste(words, collapse = " ")
+  }, character(1), USE.NAMES = FALSE)
+}
+
+# manual name corrections: replace a whole name (e.g. a crosswalk entry that
+# carries the trust name rather than the site) and fix a spelling error that
+# comes through from the provider master. Both are best corrected at source.
+name_fixes <- c(
+  "Tameside and Glossop Integrated Care NHS Foundation Trust" = "Tameside General Hospital"
+)
+fix_names <- function(x) {
+  for (bad in names(name_fixes)) x[x == bad] <- name_fixes[[bad]]
+  gsub("Westminister", "Westminster", x)
+}
+
+strip_code_suffix <- function(x) trimws(sub("\\s*\\([^)]*\\)\\s*$", "", x))
+
+# named vector: canonical site code -> cleaned display name, from the diagnosing
+# crosswalk; NULL if the crosswalk is not present.
+hospital_names <- function(path = diag_xwalk_csv) {
+  if (!file.exists(path)) return(NULL)
+  nm <- read.csv(path, colClasses = "character")
+  nm <- nm[!duplicated(nm$canonical_code), ]
+  setNames(fix_names(title_case(strip_code_suffix(nm$canonical_name))), nm$canonical_code)
 }

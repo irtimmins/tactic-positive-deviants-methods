@@ -137,11 +137,12 @@ site_p2 <- run_standardise(cvl$data, cvl$cont, cvl$bin, lambda_main,
                            ref = ref_base, target_data = cvb$data)$site
 
 site_improve <- site_p1 %>%
-  select(hosp, diag_hosp, stand1 = stand_adj, se1 = se_adj_pool, n1 = n) %>%
-  inner_join(site_p2 %>% select(hosp, stand2 = stand_adj, se2 = se_adj_pool, n2 = n),
+  select(hosp, diag_hosp, stand1 = stand_adj, se1 = se_adj_pool, n1 = n, med1 = stand_med) %>%
+  inner_join(site_p2 %>% select(hosp, stand2 = stand_adj, se2 = se_adj_pool, n2 = n, med2 = stand_med),
              by = "hosp") %>%
   mutate(delta = stand2 - stand1,            # negative = faster over time
-         se_delta = sqrt(se1^2 + se2^2))
+         se_delta = sqrt(se1^2 + se2^2),
+         delta_med = med2 - med1)            # weighted-median change (used in 09)
 saveRDS(site_improve, file.path(out_dir, "site_improve.rds"))
 
 # comorbidity strata ---------------------------------------------------------
