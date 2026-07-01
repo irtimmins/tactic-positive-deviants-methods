@@ -37,51 +37,70 @@ df   <- cv$data
 cont <- cv$cont; bin <- cv$bin
 
 # model-based direct standardisation (g-computation). Fit a fixed-effect model
-# with hospital coded outright (no intercept, one term per hospital) plus the
-# same age + cci covariates the weighting uses. The direct-standardised mean for
-# a hospital is the average predicted wait if the whole sample were treated at
-# that hospital, which for this linear, additive model is that hospital's own
-# effect plus the population-mean covariate vector times the covariate
-# coefficients - a linear contrast of the fitted coefficients. Its standard error
-# is that contrast's se from the model covariance (L V L'), so the estimate and se
-# feed the same Bayesian shrinkage as the weighted estimate.
-regstd_gcomp <- function(d, cont, bin) {
-  d <- d %>% mutate(hospf = factor(hosp))
-  covs <- c(cont, bin)
-  form <- as.formula(paste("wait ~ 0 + hospf +", paste(covs, collapse = " + ")))
-  m <- lm(form, data = d)
-  b <- coef(m); V <- vcov(m)
-  hs   <- levels(d$hospf)
-  xbar <- colMeans(d[covs])                       # population mean covariate vector
-  L <- matrix(0, nrow = length(hs), ncol = length(b), dimnames = list(hs, names(b)))
-  for (i in seq_along(hs)) {
-    L[i, paste0("hospf", hs[i])] <- 1             # this hospital's own effect
-    L[i, names(xbar)]            <- xbar          # averaged over the whole case-mix
+# Model-based direct standardisation (g-computation) for the sustained estimand.
+# Fit one linear model with a separate term for every hospital (no intercept, so
+# each hospital gets its own coefficient) plus the same age + comorbidity
+# covariates the weighting uses. A hospital's directly-standardised mean is the
+# average predicted wait if the whole sample were treated at that hospital.
+# Because the model is linear and the covariates enter additively, that average
+# is simply: (this hospital's own coefficient) + (the population-mean covariate
+# vector) times (the covariate coefficients). Writing that as a linear
+# combination L of the coefficients gives the mean as L %*% coef and, crucially,
+# its standard error as sqrt(L %*% vcov %*% L') - the exact model-based se, with
+# no bootstrap. (L %*% coef equals a plain predict-every-patient-and-average;
+# this equivalence is checked in the repository tests.)
+model_based_standardise <- function(patient_data, continuous_covariates, binary_covariates) {
+  data       <- patient_data %>% mutate(hospital = factor(hosp))
+  covariates <- c(continuous_covariates, binary_covariates)
+  
+  model <- lm(as.formula(paste("wait ~ 0 + hospital +", paste(covariates, collapse = " + "))),
+              data = data)
+  coefficients    <- coef(model)
+  covariance      <- vcov(model)
+  hospital_levels <- levels(data$hospital)
+  covariate_means <- colMeans(data[covariates])       # the population case-mix
+  
+  # one row of L per hospital: 1 on its own hospital coefficient, and the
+  # population covariate means on the covariate coefficients
+  L <- matrix(0, nrow = length(hospital_levels), ncol = length(coefficients),
+              dimnames = list(hospital_levels, names(coefficients)))
+  for (i in seq_along(hospital_levels)) {
+    L[i, paste0("hospital", hospital_levels[i])] <- 1
+    L[i, names(covariate_means)]                 <- covariate_means
   }
-  data.frame(hosp = as.integer(hs),
-             reg_mean = as.numeric(L %*% b),
-             reg_se   = sqrt(diag(L %*% V %*% t(L))))
+  
+  data.frame(hosp     = as.integer(hospital_levels),
+             reg_mean = as.numeric(L %*% coefficients),
+             reg_se   = sqrt(diag(L %*% covariance %*% t(L))))
 }
 
-# the improvement analogue: the change in the direct-standardised mean between
-# the two periods. With additive covariates the covariate part cancels in the
-# difference, so the change is the contrast (second - first) of each hospital's
-# period-specific effect, again with its se from the model covariance.
-regstd_change <- function(d, cont, bin) {
-  d <- d %>% mutate(hp = factor(paste(hosp, period, sep = "_")))
-  covs <- c(cont, bin)
-  form <- as.formula(paste("wait ~ 0 + hp +", paste(covs, collapse = " + ")))
-  m <- lm(form, data = d)
-  b <- coef(m); V <- vcov(m)
-  hosps <- sort(unique(d$hosp))
-  L <- matrix(0, nrow = length(hosps), ncol = length(b), dimnames = list(hosps, names(b)))
-  for (i in seq_along(hosps)) {
-    L[i, paste0("hp", hosps[i], "_second")] <-  1
-    L[i, paste0("hp", hosps[i], "_first")]  <- -1
+# The improvement analogue: the change in a hospital's model-based standardised
+# mean between the two halves. Fit one coefficient per hospital-and-half (again
+# no intercept) plus the covariates; the change for a hospital is its later-half
+# coefficient minus its earlier-half coefficient. The additive covariate part is
+# identical in both halves and cancels in the difference, so no covariate means
+# are needed here. The se again comes from that contrast's model covariance.
+model_based_change <- function(patient_data, continuous_covariates, binary_covariates) {
+  data       <- patient_data %>% mutate(hospital_half = factor(paste(hosp, period, sep = "_")))
+  covariates <- c(continuous_covariates, binary_covariates)
+  
+  model <- lm(as.formula(paste("wait ~ 0 + hospital_half +", paste(covariates, collapse = " + "))),
+              data = data)
+  coefficients <- coef(model)
+  covariance   <- vcov(model)
+  hospitals    <- sort(unique(data$hosp))
+  
+  # one row of L per hospital: +1 on its later-half term, -1 on its earlier-half term
+  L <- matrix(0, nrow = length(hospitals), ncol = length(coefficients),
+              dimnames = list(hospitals, names(coefficients)))
+  for (i in seq_along(hospitals)) {
+    L[i, paste0("hospital_half", hospitals[i], "_second")] <-  1
+    L[i, paste0("hospital_half", hospitals[i], "_first")]  <- -1
   }
-  data.frame(hosp = hosps,
-             reg_mean = as.numeric(L %*% b),
-             reg_se   = sqrt(diag(L %*% V %*% t(L))))
+  
+  data.frame(hosp     = hospitals,
+             reg_mean = as.numeric(L %*% coefficients),
+             reg_se   = sqrt(diag(L %*% covariance %*% t(L))))
 }
 
 # indirect standardisation: expected wait from a pooled case-mix model, then
@@ -112,7 +131,7 @@ raw_shr <- stan_shrink_rank(site$raw_mean, site$se_raw)
 site$raw_shrunk_rank <- raw_shr$exp_rank
 
 # model-based direct standardisation and its shrunk rank (same routine again)
-reg_sus <- regstd_gcomp(df, cont, bin)
+reg_sus <- model_based_standardise(patient_data = df, continuous_covariates = cont, binary_covariates = bin)
 reg_sus$reg_shrunk_rank <- stan_shrink_rank(reg_sus$reg_mean, reg_sus$reg_se)$exp_rank
 
 comp <- site %>%
@@ -149,46 +168,10 @@ write.csv(round(rho, 3), file.path(out_dir, "method_comparison_rho.csv"))
 # Sustained and improvement are shown as one continuous Word table: the broad
 # method groupings appear once at the top, the individual column titles repeat
 # before the improvement block, and only the "(arrow N)" part of each cell is
-# coloured (green up, red down); the rank number itself stays plain black.
+# coloured (green up, red down); the rank number itself stays plain black. The
+# rank-movement formatting helpers (comp_rank, move_cell, move_colour,
+# cell_prefix/suffix) are shared, in 01_config.R.
 TABLE_FONT_SIZE <- 7               # one place, so plain and coloured text match
-
-up_arrow   <- intToUtf8(8593)      # built at run time so the script stays ASCII
-down_arrow <- intToUtf8(8595)
-
-comp_rank <- function(x) rank(x, ties.method = "min")   # 1 = best (lowest value)
-
-# format one method cell: the method's rank, and its move relative to the base.
-# move > 0 means the method ranks the hospital nearer the top than the primary.
-move_cell <- function(method_rank, base_rank) {
-  move <- base_rank - method_rank
-  out  <- sprintf("%d (=)", method_rank)
-  up <- move > 0; down <- move < 0
-  out[up]   <- sprintf("%d (%s%d)", method_rank[up],   up_arrow,    move[up])
-  out[down] <- sprintf("%d (%s%d)", method_rank[down], down_arrow, -move[down])
-  out
-}
-
-# green (moved up) to red (moved down) colour for a signed rank move, used as a
-# font colour on just the "(arrow N)" part of a cell. Six colours plus black for
-# no change, so the size of the move is visible at a glance.
-move_colour <- function(m) {
-  pick <- function(x) {
-    if (is.na(x))  return("black")
-    if (x >=  6)   return("#1A9850")   # up 6+   strong green
-    if (x >=  3)   return("#66BD63")   # up 3-5  green
-    if (x >=  1)   return("#4D9221")   # up 1-2  darker light-green (legible as text)
-    if (x ==  0)   return("black")     # no change
-    if (x >= -2)   return("#B35806")   # down 1-2 darker light-orange (legible as text)
-    if (x >= -5)   return("#F46D43")   # down 3-5 orange-red
-    "#D73027"                          # down 6+  red
-  }
-  vapply(m, pick, character(1))
-}
-
-# split a formatted cell like "2 (up_arrow1)" into the plain rank prefix "2 " and
-# the parenthetical suffix "(up_arrow1)"; used to colour only the suffix.
-cell_prefix <- function(x) sub("\\(.*$", "", x)
-cell_suffix <- function(x) sub("^[^(]*", "", x)
 
 # hospital display names (Title Case, corrected, code suffix stripped) come from
 # the shared helper in 01_config.R, keyed by canonical site code.
@@ -262,7 +245,7 @@ raw_shr_imp <- stan_shrink_rank(raw_change$raw_mean, raw_change$se_raw, mu_mean 
 raw_change$raw_shrunk_rank <- raw_shr_imp$exp_rank
 
 # model-based change and its shrunk rank (same routine, centred on no change)
-reg_imp <- regstd_change(di, cont, bin)
+reg_imp <- model_based_change(patient_data = di, continuous_covariates = cont, binary_covariates = bin)
 reg_imp$reg_shrunk_rank <- stan_shrink_rank(reg_imp$reg_mean, reg_imp$reg_se, mu_mean = 0)$exp_rank
 
 # indirect change (best guess): an indirect standardisation is not uniquely

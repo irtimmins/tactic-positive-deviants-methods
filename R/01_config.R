@@ -68,7 +68,7 @@ if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 # The main analysis adjusts for two clinical factors only: age at diagnosis and
 # comorbidity (Charlson). No other patient factors (sex, ethnicity, deprivation,
 # stage) are adjusted for. Season and calendar year are held OUT of the main
-# model and enter only in the time sensitivity analysis (script 12).
+# model and enter only in the adjustment-set sensitivity analysis (script 10).
 #
 # Coding of age and cci is set here and explored in explore_covariate_coding.R.
 #   age_coding : "cont" linear age, or "band" (<50 / 50-59 / 60-69 / 70-79 / 80+)
@@ -257,6 +257,181 @@ site_summary <- function(df) {
   )
 }
 
+# Directly standardise hospital waiting times with balancing weights. This is the
+# balancing-weights half of the analysis; the body reads top to bottom as five
+# numbered steps. balancer must be loaded by the calling script.
+#
+# Arguments (the covariate arguments are column names present in patient_data):
+#   patient_data           one row per patient, with columns hosp, wait,
+#                          diag_hosp_canon, and the covariate columns named below.
+#   continuous_covariates  character vector of continuous covariate columns (age).
+#   binary_covariates      character vector of 0/1 covariate columns (comorbidity
+#                          dummies, and in the sensitivity script season / year).
+#   lambda                 balance strictness: 0 balances as exactly as possible,
+#                          larger values balance more gently and keep more
+#                          effective sample size (the main value is lambda_main).
+#   reference_moments      the means, sds and proportions of the population we want
+#                          every hospital to match. NULL uses patient_data's own
+#                          population (the usual sustained case). The improvement
+#                          estimand passes the baseline half's moments so both
+#                          halves are standardised to the same case-mix.
+#   target_population      the patients the augmented estimate predicts over.
+#                          NULL uses patient_data itself.
+#   weight_upper_limit     optional cap on a single patient's weight; NULL = none.
+#
+# Returns a list: $site (the per-hospital estimates, the only part used
+# downstream), plus $data, $weights and $model for inspection.
+run_standardise <- function(patient_data,
+                            continuous_covariates,
+                            binary_covariates,
+                            lambda             = lambda_main,
+                            reference_moments  = NULL,
+                            target_population  = NULL,
+                            weight_upper_limit = NULL) {
+  
+  data <- patient_data %>% arrange(hosp)
+  
+  # step 1  the population every hospital is standardised to. If none is supplied,
+  # it is this data's own population (its covariate means, sds and proportions).
+  if (is.null(reference_moments)) {
+    reference_moments <- ref_moments(data, continuous_covariates, binary_covariates)
+  }
+  
+  # step 2  the balance matrix: one column per covariate, centred and scaled so
+  # that 0 means "equal to the reference population". A hospital whose patients
+  # average 0 on every column already matches the reference case-mix.
+  balance_matrix <- make_std_matrix_ref(data, continuous_covariates,
+                                        binary_covariates, reference_moments)
+  
+  # drop any covariate that does not vary within this data: it carries no
+  # balancing information (and would divide by zero). The same surviving set is
+  # reused for the outcome model in step 4, so the weights and the model never
+  # disagree about which covariates exist.
+  covariate_varies <- apply(balance_matrix, 2,
+                            function(column) { s <- sd(column); is.finite(s) && s > 0 })
+  balance_matrix  <- balance_matrix[, covariate_varies, drop = FALSE]
+  covariates_used <- colnames(balance_matrix)
+  
+  # step 3  solve for the patient weights that pull each hospital's weighted
+  # covariate means to 0 (the reference case-mix), as gently as lambda allows.
+  # standardize() returns a weight for every patient-by-hospital pair; each
+  # patient's own weight is the one in their own hospital's column.
+  standardize_args <- list(X = balance_matrix, target = rep(0, ncol(balance_matrix)),
+                           Z = data$hosp, lambda = lambda, exact_global = FALSE)
+  if (!is.null(weight_upper_limit)) standardize_args$uplim <- weight_upper_limit
+  weight_solution <- do.call(standardize, standardize_args)
+  data$w <- extract_weights(weight_solution)
+  
+  # step 4  a plain outcome model on the same covariates, for the augmented
+  # (residual-balancing) estimate: its residuals correct the weighted mean, and
+  # its average prediction over the target population supplies the grand level.
+  data$y     <- data$wait                       # site_summary expects a column named y
+  outcome_model <- lm(reformulate(covariates_used, "wait"), data = data)
+  data$resid <- resid(outcome_model)
+  data$canonical <- if (is.null(target_population)) {
+    mean(fitted(outcome_model))
+  } else {
+    mean(predict(outcome_model, newdata = target_population))
+  }
+  
+  # step 5  per-hospital weighted and augmented means, effective n and pooled SEs
+  site <- site_summary(data) %>%
+    left_join(distinct(data, hosp, diag_hosp = diag_hosp_canon), by = "hosp")
+  
+  list(site = site, data = data, weights = weight_solution, model = outcome_model)
+}
+
+# The improvement estimand as a change score: for each hospital, the difference
+# between its directly-standardised mean waiting time in the LATER half of the
+# window and in the EARLIER half. Both halves are standardised to the same fixed
+# population - the earlier half's case-mix - so the difference reflects a change
+# in speed, not a change in who was diagnosed. Returns one row per hospital with
+# the change (delta, negative = faster over time), its se, and the two half
+# counts. Covariate columns must already be present in patient_data; a covariate
+# that is constant within a half (the later-year indicator) is dropped by
+# run_standardise, so passing season + year here amounts to adding season only.
+standardise_change <- function(patient_data,
+                               continuous_covariates,
+                               binary_covariates,
+                               lambda = lambda_main,
+                               min_patients_per_half = min_per_year) {
+  
+  # keep hospitals with enough patients in BOTH halves to estimate a change
+  patients_per_half <- patient_data %>%
+    count(hosp, period) %>%
+    tidyr::pivot_wider(names_from = period, values_from = n, values_fill = 0)
+  hospitals_kept <- patients_per_half %>%
+    filter(first >= min_patients_per_half, second >= min_patients_per_half) %>%
+    pull(hosp)
+  
+  earlier_half <- patient_data %>% filter(period == "first",  hosp %in% hospitals_kept)
+  later_half   <- patient_data %>% filter(period == "second", hosp %in% hospitals_kept)
+  
+  # the fixed target both halves are standardised to: the earlier half's case-mix
+  baseline_moments <- ref_moments(earlier_half, continuous_covariates, binary_covariates)
+  
+  earlier <- run_standardise(patient_data          = earlier_half,
+                             continuous_covariates = continuous_covariates,
+                             binary_covariates     = binary_covariates,
+                             lambda                = lambda,
+                             reference_moments     = baseline_moments,
+                             target_population     = earlier_half)$site
+  later   <- run_standardise(patient_data          = later_half,
+                             continuous_covariates = continuous_covariates,
+                             binary_covariates     = binary_covariates,
+                             lambda                = lambda,
+                             reference_moments     = baseline_moments,
+                             target_population     = earlier_half)$site
+  
+  earlier %>%
+    select(hosp, diag_hosp, mean_earlier = stand_adj, se_earlier = se_adj_pool, n1 = n) %>%
+    inner_join(later %>% select(hosp, mean_later = stand_adj, se_later = se_adj_pool, n2 = n),
+               by = "hosp") %>%
+    mutate(delta    = mean_later - mean_earlier,
+           se_delta = sqrt(se_earlier^2 + se_later^2))
+}
+
+# --- rank-movement formatting (shared by 09 and 10) -------------------------
+# Turn per-hospital estimates into competition ranks, format a "rank (arrow N)"
+# cell showing the move against a reference ranking, and pick a green-to-red
+# font colour for the size of that move. The arrows are built at run time so the
+# scripts stay ASCII.
+comp_rank  <- function(x) rank(x, ties.method = "min")   # 1 = best (lowest value)
+up_arrow   <- intToUtf8(8593)
+down_arrow <- intToUtf8(8595)
+
+# a formatted cell: the method's rank, and its move relative to a reference rank.
+# move > 0 means this ranking places the hospital nearer the top than the reference.
+move_cell <- function(method_rank, ref_rank) {
+  move <- ref_rank - method_rank
+  out  <- sprintf("%d (=)", method_rank)
+  up <- move > 0; down <- move < 0
+  out[up]   <- sprintf("%d (%s%d)", method_rank[up],   up_arrow,    move[up])
+  out[down] <- sprintf("%d (%s%d)", method_rank[down], down_arrow, -move[down])
+  out
+}
+
+# green (moved up) to red (moved down) font colour for a signed rank move; six
+# colours plus black for no change, so the size of the move is visible at a glance.
+move_colour <- function(m) {
+  pick <- function(x) {
+    if (is.na(x))  return("black")
+    if (x >=  6)   return("#1A9850")   # up 6+   strong green
+    if (x >=  3)   return("#66BD63")   # up 3-5  green
+    if (x >=  1)   return("#4D9221")   # up 1-2  darker light-green (legible as text)
+    if (x ==  0)   return("black")     # no change
+    if (x >= -2)   return("#B35806")   # down 1-2 darker light-orange (legible as text)
+    if (x >= -5)   return("#F46D43")   # down 3-5 orange-red
+    "#D73027"                          # down 6+  red
+  }
+  vapply(m, pick, character(1))
+}
+
+# split a formatted cell "2 (arrow1)" into the plain rank prefix and the
+# parenthetical suffix, so only the suffix is coloured.
+cell_prefix <- function(x) sub("\\(.*$", "", x)
+cell_suffix <- function(x) sub("^[^(]*", "", x)
+
 # posterior ranking metrics from a draws-by-hospital matrix of latent means.
 # shorter wait is better, so rank 1 is the best performer. For each posterior
 # draw we rank the hospitals, then summarise each hospital's rank across draws.
@@ -306,7 +481,9 @@ fit_shrink <- function(y, se, mu_mean = mean(y),
 stan_shrink_rank <- function(y, se, mu_mean = mean(y)) {
   fit   <- fit_shrink(y, se, mu_mean = mu_mean)
   draws <- rstan::extract(fit, pars = "y_site_true")$y_site_true   # draws x hospitals
-  data.frame(post_mean = colMeans(draws), exp_rank = rank_metrics(draws)$exp_rank)
+  data.frame(post_mean = colMeans(draws),
+             post_sd   = apply(draws, 2, sd),
+             exp_rank  = rank_metrics(draws)$exp_rank)
 }
 
 # resolve recorded hospital codes to canonical hospitals using the optional
