@@ -6,7 +6,7 @@
 # The comparison is deliberately built from two clean steps, so every method is
 # on the same footing:
 #   step 1 - generate a per-hospital mean waiting time, either case-mix adjusted
-#            (balancing-weights direct standardisation, the main model) or not
+#            (balancing-weights direct standardisation, the primary model) or not
 #            adjusted at all (raw mean);
 #   step 2 - optionally shrink those means with the one Bayesian normal-normal
 #            routine (fit_shrink, in 01_config.R) - the same routine that feeds
@@ -32,15 +32,22 @@ df    <- readRDS(file.path(out_dir, "analysis_data.rds"))
 fit_p <- readRDS(file.path(out_dir, "fit_primary.rds"))
 sus   <- read.csv(file.path(out_dir, "ranks_sustained.csv"))   # headline weighted + shrinkage
 
-cv   <- code_covariates(df)          # the main model case-mix (age + cci)
+cv   <- code_covariates(df)          # age + comorbidity
 df   <- cv$data
 cont <- cv$cont; bin <- cv$bin
+# the primary adjustment set (age + cci + season + calendar year) is what the
+# headline weighted column uses, so the regression and indirect methods below
+# standardise on the same set - the comparison is then of method, not of set.
+# For the change score the later-year indicator coincides with the period split,
+# so only season is added there (year would alias the hospital-half terms).
+bin_primary <- c(bin, season_terms, year_term)
+bin_change  <- c(bin, season_terms)
 
 # model-based direct standardisation (g-computation). Fit a fixed-effect model
 # Model-based direct standardisation (g-computation) for the sustained estimand.
 # Fit one linear model with a separate term for every hospital (no intercept, so
-# each hospital gets its own coefficient) plus the same age + comorbidity
-# covariates the weighting uses. A hospital's directly-standardised mean is the
+# each hospital gets its own coefficient) plus the same primary-set covariates
+# the weighting uses. A hospital's directly-standardised mean is the
 # average predicted wait if the whole sample were treated at that hospital.
 # Because the model is linear and the covariates enter additively, that average
 # is simply: (this hospital's own coefficient) + (the population-mean covariate
@@ -105,7 +112,7 @@ model_based_change <- function(patient_data, continuous_covariates, binary_covar
 
 # indirect standardisation: expected wait from a pooled case-mix model, then
 # observed - expected + grand mean. Also the basis for the sustained funnel plot.
-pm <- lm(as.formula(paste("wait ~", paste(c(cont, bin), collapse = " + "))),
+pm <- lm(as.formula(paste("wait ~", paste(c(cont, bin_primary), collapse = " + "))),
          data = df)
 df$pred <- predict(pm)
 grand   <- mean(df$wait)
@@ -131,7 +138,7 @@ raw_shr <- stan_shrink_rank(site$raw_mean, site$se_raw)
 site$raw_shrunk_rank <- raw_shr$exp_rank
 
 # model-based direct standardisation and its shrunk rank (same routine again)
-reg_sus <- model_based_standardise(patient_data = df, continuous_covariates = cont, binary_covariates = bin)
+reg_sus <- model_based_standardise(patient_data = df, continuous_covariates = cont, binary_covariates = bin_primary)
 reg_sus$reg_shrunk_rank <- stan_shrink_rank(reg_sus$reg_mean, reg_sus$reg_se)$exp_rank
 
 comp <- site %>%
@@ -245,7 +252,7 @@ raw_shr_imp <- stan_shrink_rank(raw_change$raw_mean, raw_change$se_raw, mu_mean 
 raw_change$raw_shrunk_rank <- raw_shr_imp$exp_rank
 
 # model-based change and its shrunk rank (same routine, centred on no change)
-reg_imp <- model_based_change(patient_data = di, continuous_covariates = cont, binary_covariates = bin)
+reg_imp <- model_based_change(patient_data = di, continuous_covariates = cont, binary_covariates = bin_change)
 reg_imp$reg_shrunk_rank <- stan_shrink_rank(reg_imp$reg_mean, reg_imp$reg_se, mu_mean = 0)$exp_rank
 
 # indirect change (best guess): an indirect standardisation is not uniquely

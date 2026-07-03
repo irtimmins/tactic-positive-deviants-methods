@@ -17,7 +17,10 @@ df <- df %>%
   mutate(bin = floor(as.numeric(interval(start_date, diagmdy), "months") / 6) + 1,
          bin = factor(bin, labels = paste0("H", sort(unique(bin)))))
 
-# pooled prognostic model for expected wait (main case-mix: age + cci)
+# pooled prognostic model for expected wait. Case-mix only (age + cci): season
+# and calendar year are deliberately NOT adjusted for here, because this plot
+# exists to show how standardised waits move across the six-month periods, and
+# adjusting for calendar time would remove the very signal it is meant to show.
 cv <- code_covariates(df); df <- cv$data
 pm <- lm(as.formula(paste("wait ~", paste(c(cv$cont, cv$bin), collapse = " + "))),
          data = df)

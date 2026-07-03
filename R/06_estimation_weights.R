@@ -45,11 +45,14 @@ balance_tradeoff <- function(d, cont, bin, grid = lambda_grid) {
   as.data.frame(res)
 }
 
-# main analysis: case-mix (age + cci) standardisation ------------------------
-# NB the main model deliberately excludes season and calendar year (they are a
-# sensitivity analysis, script 10) and all other patient factors.
-cv    <- code_covariates(df)
-trade <- balance_tradeoff(cv$data, cv$cont, cv$bin)
+# main analysis: primary standardisation (age + cci + season + calendar year) -
+# season and calendar year are part of the primary adjustment set; their
+# inclusion, and the choice to keep age linear, are justified against outcome
+# fit and effective sample size in script 15. Other patient factors (sex,
+# ethnicity, deprivation, stage) remain excluded.
+cv          <- code_covariates(df)
+primary_bin <- c(cv$bin, season_terms, year_term)
+trade       <- balance_tradeoff(cv$data, cv$cont, primary_bin)
 cat("balance vs effective n by lambda:\n"); print(round(trade, 3))
 write.csv(trade, file.path(out_dir, "lambda_tradeoff.csv"), row.names = FALSE)
 
@@ -78,7 +81,7 @@ ggsave(file.path(out_dir, "lambda_tradeoff.pdf"), p_trade, width = 7, height = 5
 
 fit_main <- run_standardise(patient_data          = cv$data,
                             continuous_covariates = cv$cont,
-                            binary_covariates     = cv$bin,
+                            binary_covariates     = primary_bin,
                             lambda                = lambda_main)
 site_sustained <- fit_main$site
 saveRDS(fit_main,       file.path(out_dir, "fit_primary.rds"))
@@ -87,15 +90,19 @@ saveRDS(site_sustained, file.path(out_dir, "site_sustained.rds"))
 # improvement estimand -------------------------------------------------------
 # baseline period = first half of the window; later period = second half. Both
 # are standardised to the SAME reference: the case-mix of the baseline period.
-# The period split is the design here, so calendar terms are not covariates.
+# The later-year indicator is constant within a half and is dropped by
+# run_standardise, so the improvement estimand adjusts age + cci + season.
 site_improve <- standardise_change(patient_data          = cv$data,
                                    continuous_covariates = cv$cont,
-                                   binary_covariates     = cv$bin)
+                                   binary_covariates     = primary_bin)
 saveRDS(site_improve, file.path(out_dir, "site_improve.rds"))
 
 # comorbidity strata ---------------------------------------------------------
 # within a stratum comorbidity is near-constant, so adjust for age only and
-# standardise to the stratum population.
+# standardise to the stratum population. Season and calendar year are NOT added
+# here, to preserve effective sample size in the smaller stratum samples; add
+# c(season_terms, year_term) below if you prefer the strata to mirror the
+# primary adjustment set exactly.
 for (st in levels(df$cci_strata)) {
   cvs <- code_covariates(filter(df, cci_strata == st), cci = "none")
   fit_st <- run_standardise(patient_data          = cvs$data,

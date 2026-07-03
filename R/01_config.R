@@ -57,7 +57,7 @@ drop_zero_wait <- TRUE             # exclude exact zero-day waits (see note in 0
 # canonical 5-digit diagnosing and treating sites. 04 reads these to canonicalise
 # and to keep only valid providers. Curate the crosswalks once, then rerun 04.
 qc_dir          <- file.path(out_dir, "provider_qc")
-site_xlsx       <- file.path("Data/Site_level", "NHSHospitals_services_5.3.26_with_colours.xlsx")
+site_xlsx       <- file.path(base_dir, "Site_level", "NHSHospitals_services_5.3.26_with_colours.xlsx")
 diag_xwalk_csv  <- file.path(qc_dir, "diag_crosswalk.csv")    # raw_code, canonical_code, canonical_name
 treat_xwalk_csv <- file.path(qc_dir, "treat_crosswalk.csv")
 diag_include_csv  <- file.path(qc_dir, "diag_include.csv")    # canonical_code (valid diagnosing sites)
@@ -65,10 +65,14 @@ treat_include_csv <- file.path(qc_dir, "treat_include.csv")  # canonical_code (b
 if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 
 # case-mix adjustment --------------------------------------------------------
-# The main analysis adjusts for two clinical factors only: age at diagnosis and
-# comorbidity (Charlson). No other patient factors (sex, ethnicity, deprivation,
-# stage) are adjusted for. Season and calendar year are held OUT of the main
-# model and enter only in the adjustment-set sensitivity analysis (script 10).
+# The primary model adjusts for age at diagnosis (linear), comorbidity
+# (Charlson, coded 0 / 1 / 2+), season (quarter of diagnosis) and calendar-year
+# half. No other patient factors (sex, ethnicity, deprivation, stage) are
+# adjusted for. Two adjustment choices are justified in the supplementary table
+# (script 15): that age needs no quadratic or cubic term, and that season and
+# calendar year earn their place - each weighed by outcome-model fit (AIC and a
+# likelihood-ratio test) against the effective sample size the extra balancing
+# costs.
 #
 # Coding of age and cci is set here and explored in explore_covariate_coding.R.
 #   age_coding : "cont" linear age, or "band" (<50 / 50-59 / 60-69 / 70-79 / 80+)
@@ -82,9 +86,12 @@ if (!dir.exists(qc_dir)) dir.create(qc_dir, recursive = TRUE)
 age_coding <- "cont"
 cci_coding <- "0_1_2plus"
 
-# season (quarter) and calendar-period indicators, added ONLY in the time
-# sensitivity analysis, never in the main model
-time_bin <- c("q2", "q3", "q4", "yr_late")
+# season (quarter) and calendar-period indicator columns, built in 02. The
+# primary model includes them; season_terms and year_term name the two groups so
+# the estimation and supplementary scripts refer to one definition.
+time_bin     <- c("q2", "q3", "q4", "yr_late")
+season_terms <- c("q2", "q3", "q4")   # quarter-of-diagnosis dummies (ref = Q1)
+year_term    <- "yr_late"             # later calendar-year half of the window
 
 # build the case-mix covariates for a given coding: returns the (augmented) data
 # and the continuous / binary covariate names to hand to the weighting step.
@@ -137,6 +144,12 @@ lambda_main <- 0.05
 #   differences. Both are weakly informative on the day scale.
 prior_mu_sd     <- 50
 prior_tau_scale <- 10
+
+# effective sample size ------------------------------------------------------
+# after weighting a hospital with fewer than this many effective patients has
+# little usable information; flagged by the ESS diagnostics (14) and the
+# adjustment-set justification table (15).
+ess_threshold <- 10
 
 # ============================================================================
 # PART B  -  helper functions (no need to edit)
@@ -389,6 +402,19 @@ standardise_change <- function(patient_data,
                by = "hosp") %>%
     mutate(delta    = mean_later - mean_earlier,
            se_delta = sqrt(se_earlier^2 + se_later^2))
+}
+
+# --- effective sample size ---------------------------------------------------
+# per-hospital Kish effective sample size from a run_standardise() result. The
+# weights already sit in fit$data$w, so ESS = (sum w)^2 / sum(w^2). deff is the
+# variance inflation (n / ESS) and pct_reduction the share of the raw count the
+# weighting spends. label tags the adjustment set the fit came from.
+hospital_ess <- function(fit, label) {
+  library(dplyr)
+  fit$data %>%
+    group_by(hosp, diag_hosp = diag_hosp_canon) %>%
+    summarise(n = n(), ess = sum(w)^2 / sum(w^2), .groups = "drop") %>%
+    mutate(deff = n / ess, pct_reduction = 100 * (1 - ess / n), adjustment_set = label)
 }
 
 # --- rank-movement formatting (shared by 09 and 10) -------------------------

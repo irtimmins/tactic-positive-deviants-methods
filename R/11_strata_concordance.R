@@ -1,6 +1,8 @@
 # Consistency of positive-deviant hospitals across comorbidity strata.
 # Question: do the hospitals that look fast in the overall (whole-cohort)
 # sustained analysis also look fast within each comorbidity stratum? The overall
+# analysis is the primary model (age + cci + season + calendar year); the strata
+# adjust for age only (comorbidity is near-constant within a stratum). The overall
 # result is the reference on both comparisons; the two strata are not compared
 # with each other. Three views are produced and the per-stratum caterpillars in
 # 05 are left as they are.
@@ -119,4 +121,3 @@ cat(sprintf("  also top 20%% in CCI 0-1: %d\n",
             sum(conc_tab$overall_cand & conc_tab$cci01_ptop20 >= prob_cut, na.rm = TRUE)))
 cat(sprintf("  also top 20%% in CCI 2+ : %d\n",
             sum(conc_tab$overall_cand & conc_tab$cci2_ptop20 >= prob_cut, na.rm = TRUE)))
-
