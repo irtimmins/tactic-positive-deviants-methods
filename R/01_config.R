@@ -47,6 +47,21 @@ min_per_year <- 10
 site_min_vol    <- 20
 dominance_share <- 0.95
 
+# small-number suppression: heat-map cells (hospital x period) with fewer than
+# cell_suppress_n patients are shown without a value, not because of the
+# standardisation (which never removes a cell) but because a mean from a handful
+# of patients is unstable. This is a disclosure judgement, distinct from the
+# study's inclusion floor (min_per_year, which decides whether a hospital is
+# analysed at all): NBOCA's own rule (methodology supplement, section 7.1)
+# suppresses indicators with a denominator below 10, but that is written for
+# outputs where the denominator is shown alongside the value. The heat map never
+# displays patient counts, only the standardised mean, so 5 is judged sufficient
+# here. Set to 1 to show every cell that has at least one patient and suppress
+# nothing (a cell with zero patients has no mean to show and stays blank either
+# way). 12_heatmap_stability.R and heatmap_diagnostics.R share this threshold so
+# the plot and its diagnostics agree.
+cell_suppress_n <- 5
+
 # outcome --------------------------------------------------------------------
 outcome_var    <- "wt_dx_to_dtt"   # days from diagnosis to decision-to-treat
 max_wait       <- 180              # exclude waits longer than this as implausible
