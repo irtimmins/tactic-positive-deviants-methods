@@ -50,7 +50,7 @@ col_improve <- "#009E73"       # greatest improvement
 read_ranks <- function(file) {
   if (!file.exists(file)) return(NULL)
   read.csv(file, stringsAsFactors = FALSE) %>%
-    transmute(diag_hosp = as.character(diag_hosp), post_mean, ci_lo, ci_hi)
+    transmute(diag_hosp = as.character(diag_hosp), post_mean, ci_lo, ci_hi, exp_rank)
 }
 
 # shared theme so all four panels match; top margin leaves room for the a-d label
@@ -61,10 +61,10 @@ panel_theme <- theme_classic(base_size = 11) +
         plot.margin = margin(t = lab_top_margin, r = 4, b = 2, l = 2))
 
 # --- caterpillar panel -------------------------------------------------------
-# hospitals ordered by their estimate; segment = credible interval; a grey
-# reference line at the given level. from_zero floors the y-axis at 0.
+# hospitals ordered by expected posterior rank; segment = credible interval; a
+# grey reference line at the given level. from_zero floors the y-axis at 0.
 caterpillar_panel <- function(d, ylab, ref_line, from_zero = FALSE, ytitle_vjust = 1) {
-  d <- d %>% arrange(post_mean) %>% mutate(rank = row_number())
+  d <- d %>% arrange(exp_rank) %>% mutate(rank = row_number())
   p <- ggplot(d, aes(rank, post_mean)) +
     geom_hline(yintercept = ref_line, linewidth = 1, alpha = 0.6, colour = "gray30") +
     geom_segment(aes(xend = rank, y = ci_lo, yend = ci_hi),

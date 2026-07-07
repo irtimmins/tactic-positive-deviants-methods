@@ -39,5 +39,9 @@ step("12_heatmap_stability.R")           # stability over six-month periods
 step("13_sensitivity_covariates.R")      # quick raw robustness of the ranking
 step("14_summary_figure.R")              # four-panel summary figure
 step("15_adjustment_justification.R")    # adjustment-set justification (AIC + ESS)
+step("16_prior_sensitivity.R")    # ...
+step("17_method_scatter.R")    # adjustment-set justification (AIC + ESS)
+
+
 
 message("\nAnalysis complete. Outputs in Output/.")

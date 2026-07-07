@@ -9,12 +9,12 @@
 #   fit  - does adding the terms improve the outcome model, by AIC and by a
 #          likelihood-ratio test against the age + comorbidity base;
 #   cost - what does balancing on the larger set do to the effective sample size
-#          (median and minimum across hospitals, mean percent reduction, and how
-#          many hospitals fall below the usable threshold).
+#          (median and minimum across hospitals, and the mean percent reduction).
 # Starting from age + comorbidity we test, separately, whether age needs a
-# quadratic or cubic term (non-linearity) and whether season and calendar year
-# earn their place. The table lets fit and precision be read side by side, so a
-# term is only kept if the fit gain is worth the sample-size it spends.
+# quadratic or cubic term (non-linearity), whether season and calendar year earn
+# their place, and whether a finer comorbidity coding (0/1/2/3+) improves on the
+# base 0/1/2+. The table lets fit and precision be read side by side, so a term
+# is only kept if the fit gain is worth the sample-size it spends.
 
 library(balancer)
 library(dplyr)
@@ -41,6 +41,15 @@ df$age_cube  <- age_c^3
 # predictors (the same covariates) used for AIC and the likelihood-ratio test.
 base_cont <- cv$cont                           # agediag
 base_bin  <- cci
+
+# finer comorbidity coding (0/1/2/3+): split the base 2+ into separate 2 and 3+
+# categories. The base 0/1/2+ is this model with the 2 and 3+ effects held equal,
+# so the two are nested and the likelihood-ratio test against the base is valid
+# (1 df); balancing on the extra category also lets its cost in ESS be seen.
+df$cci_2  <- as.integer(df$cci_n_conditions == 2)
+df$cci_3p <- as.integer(df$cci_n_conditions >= 3)
+cci_fine  <- c(base_bin[1], "cci_2", "cci_3p")   # reuse the "1" dummy, split 2+
+
 sets <- list(
   list(label = "Age + comorbidity (base)",
        cont = base_cont,                          bin = base_bin),
@@ -53,7 +62,11 @@ sets <- list(
   list(label = "Base + calendar year",
        cont = base_cont,                          bin = c(base_bin, year_term)),
   list(label = "Base + season + calendar year",
-       cont = base_cont,                          bin = c(base_bin, season_terms, year_term)))
+       cont = base_cont,                          bin = c(base_bin, season_terms, year_term)),
+  list(label = "Comorbidity 0/1/2/3+ (vs base 0/1/2+)",
+       cont = base_cont,                          bin = cci_fine),
+  list(label = "Comorbidity 0/1/2/3+ + season + calendar year",
+       cont = base_cont,                          bin = c(cci_fine, season_terms, year_term)))
 
 # fit the base outcome model once; every candidate is tested against it
 base_model <- lm(reformulate(c(base_cont, base_bin), "wait"), df)
@@ -108,9 +121,7 @@ print(results %>% mutate(across(where(is.numeric), ~ round(.x, 2))), row.names =
 # --- Word table -------------------------------------------------------------
 # formatting: the base row shows dashes where a test against itself is undefined.
 fmt_num <- function(x, digits = 1) ifelse(is.na(x), "-", formatC(x, format = "f", digits = digits))
-fmt_p   <- function(p) ifelse(is.na(p), "-",
-                              ifelse(p < 0.001, formatC(p, format = "e", digits = 1),
-                                     formatC(p, format = "f", digits = 3)))
+fmt_p   <- function(p) ifelse(is.na(p), "-", formatC(p, format = "g", digits = 2))
 fmt_lr  <- function(chisq, df) ifelse(is.na(chisq), "-",
                                       sprintf("%s (%d)", formatC(chisq, format = "f", digits = 1), df))
 
@@ -124,7 +135,6 @@ disp <- data.frame(
   med_ess   = fmt_num(results$median_ess, 1),
   min_ess   = fmt_num(results$min_ess, 1),
   reduction = fmt_num(results$mean_pct_reduction, 1),
-  below     = ifelse(is.na(results$n_below_threshold), "-", as.character(results$n_below_threshold)),
   stringsAsFactors = FALSE, check.names = FALSE)
 
 # insert the two family heading rows (age non-linearity, then calendar terms)
@@ -133,48 +143,64 @@ heading <- function(text) {
   names(r) <- names(disp); r
 }
 combined <- rbind(disp[1, ],                       # base
-                  heading("Non-linearity of age"),
+                  heading("Assess relationship with age"),
                   disp[2:3, ],                      # age^2, age^3
-                  heading("Calendar adjustment"),
-                  disp[4:6, ])                      # season, year, season + year
+                  heading("Assess impact of calendar/year adjustment"),
+                  disp[4:6, ],                      # season, year, season + year
+                  heading("Assess comorbidity coding"),
+                  disp[7:8, ])                      # comorbidity 0/1/2/3+, and with season + year
 
 row_base    <- 1
 row_head_ag <- 2
 rows_age    <- 3:4
 row_head_cal<- 5
 rows_cal    <- 6:8
-head_rows   <- c(row_head_ag, row_head_cal)
+row_head_cci<- 9
+rows_cci    <- 10:11
+head_rows   <- c(row_head_ag, row_head_cal, row_head_cci)
 
 FONT <- 8
 ft <- flextable(combined)
 ft <- set_header_labels(ft,
-                        set = "Adjustment set", params = "Parameters", AIC = "AIC", dAIC = "dAIC",
-                        LR = "LR chi-square (df)", p = "p-value", med_ess = "Median ESS",
-                        min_ess = "Minimum ESS", reduction = "Mean reduction (%)",
-                        below = sprintf("Hospitals ESS < %d", ess_threshold))
+                        set = "Adjustment set", params = "Parameters", AIC = "AIC",
+                        dAIC = "Difference in AIC", LR = "Likelihood ratio (LR), chi-square (df)",
+                        p = "p-value", med_ess = "Median ESS", min_ess = "Minimum ESS",
+                        reduction = "Mean reduction in ESS (%)")
 
 # the two family headings span the full width
 for (r in head_rows) ft <- merge_at(ft, i = r, j = seq_len(ncol(combined)), part = "body")
 ft <- bold(ft, i = head_rows, part = "body")
 ft <- bold(ft, i = row_base, j = "set", part = "body")
-ft <- italic(ft, i = rows_age, j = "set", part = "body")   # indent-by-style the family members
+ft <- italic(ft, i = rows_age, j = "set", part = "body")   # italic + indent the family members
 ft <- italic(ft, i = rows_cal, j = "set", part = "body")
+ft <- italic(ft, i = rows_cci, j = "set", part = "body")
 ft <- bold(ft, part = "header")
 
 ft <- align(ft, part = "all", align = "center")
 ft <- align(ft, j = "set", align = "left", part = "all")
 ft <- align(ft, i = head_rows, align = "left", part = "body")
 
-rule <- fp_border(color = "black", width = 1)
-ft <- border_outer(ft, border = rule, part = "body")
-ft <- hline(ft, i = row_base,        border = rule, part = "body")
-ft <- hline(ft, i = max(rows_age),   border = rule, part = "body")
-ft <- hline_bottom(ft, border = rule, part = "header")
+box  <- fp_border(color = "black",  width = 1)
+soft <- fp_border(color = "grey65", width = 0.5)
+ft <- border_outer(ft, border = box, part = "all")     # box around the whole table
+ft <- hline(ft, i = row_base,        border = soft, part = "body")
+ft <- hline(ft, i = max(rows_age),   border = soft, part = "body")
+ft <- hline(ft, i = max(rows_cal),   border = soft, part = "body")
+ft <- hline_bottom(ft, border = soft, part = "header")
 
 ft <- fontsize(ft, size = FONT, part = "all")
 ft <- padding(ft, padding.top = 1.5, padding.bottom = 1.5, part = "all")
+ft <- padding(ft, i = c(rows_age, rows_cal, rows_cci), j = "set", padding.left = 16, part = "body")
 ft <- autofit(ft)
-ft <- width(ft, j = "set", width = 2.2)
+ft <- width(ft, j = "set",       width = 2.15)   # +30%
+ft <- width(ft, j = "params",    width = 0.85)
+ft <- width(ft, j = "AIC",       width = 0.64)   # +20%
+ft <- width(ft, j = "dAIC",      width = 0.72)   # +20%
+ft <- width(ft, j = "LR",        width = 1.15)
+ft <- width(ft, j = "p",         width = 0.60)   # -20%
+ft <- width(ft, j = "med_ess",   width = 0.67)
+ft <- width(ft, j = "min_ess",   width = 0.67)
+ft <- width(ft, j = "reduction", width = 0.74)
 ft <- set_table_properties(ft, layout = "fixed", align = "left")
 
 caption_text <- paste(
@@ -182,13 +208,16 @@ caption_text <- paste(
   "from age (linear) and comorbidity (0/1/2+), each candidate is judged by",
   "outcome-model fit (AIC and a likelihood-ratio test against the base) and by",
   "the effective sample size the balancing costs (Kish ESS per hospital). The",
-  "adopted primary model is the base plus season and calendar year (final row).")
+  "adopted primary model is the base plus season and calendar year; the final rows",
+  "additionally check a finer comorbidity coding (0/1/2/3+), alone and with season",
+  "and calendar year.")
 footnote_text <- paste(
   "Age is centred before squaring, so the likelihood-ratio test is identical to",
   "raw polynomials. ESS = (sum of weights)^2 / sum of squared weights per",
-  "hospital; the reduction is the mean percent fall from the raw count;",
-  sprintf("hospitals below %d effective patients are counted in the last column.", ess_threshold),
-  "A term is retained only where the fit gain justifies the effective-sample-size cost.")
+  "hospital; the reduction is the mean percent fall from the raw count. A term is",
+  "retained only where the fit gain justifies the effective-sample-size cost. The",
+  "comorbidity 0/1/2/3+ row splits the base 2+ category; the base is nested within",
+  "it, so its test (1 df) asks whether separating 3+ from 2 improves fit.")
 
 doc <- read_docx()
 doc <- body_set_default_section(doc, prop_section(page_size = page_size(orient = "landscape")))

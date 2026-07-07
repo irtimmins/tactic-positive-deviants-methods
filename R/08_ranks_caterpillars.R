@@ -23,14 +23,14 @@ process_fit <- function(obj, id_col = "diag_hosp") {
     mutate(
       post_mean = colMeans(draws),
       post_sd   = apply(draws, 2, sd),
-      ci_lo     = post_mean - 1.96 * post_sd,
-      ci_hi     = post_mean + 1.96 * post_sd
+      ci_lo     = apply(draws, 2, quantile, probs = 0.025),
+      ci_hi     = apply(draws, 2, quantile, probs = 0.975)
     ) %>%
     bind_cols(rm)
 }
 
 caterpillar <- function(d, ylab, title, highlight = NA) {
-  d <- d %>% arrange(post_mean) %>% mutate(rank_order = row_number())
+  d <- d %>% arrange(exp_rank) %>% mutate(rank_order = row_number())
   hl <- if (!is.na(highlight)) d$diag_hosp == highlight else rep(FALSE, nrow(d))
   ggplot(d, aes(rank_order, post_mean)) +
     geom_hline(yintercept = mean(d$post_mean), colour = "grey50") +
@@ -69,28 +69,30 @@ ggsave(file.path(out_dir, "caterpillar_improve.pdf"),
 hosp_name <- hospital_names()
 
 top_table <- function(d, top_n = 20) {
-  d <- d %>% arrange(post_mean) %>% mutate(rank = row_number())
+  d <- d %>% arrange(exp_rank) %>% mutate(rank = row_number())
   d <- d[seq_len(min(top_n, nrow(d))), ]
   nm <- if (is.null(hosp_name)) rep(NA_character_, nrow(d))
   else unname(hosp_name[as.character(d$diag_hosp)])
   data.frame(
     Rank     = as.character(d$rank),
+    ExpRank  = sprintf("%.1f", d$exp_rank),
     Hospital = ifelse(is.na(nm) | nm == "", as.character(d$diag_hosp), nm),
     SiteCode = as.character(d$diag_hosp),
-    Patients = as.character(d$patients),
-    Estimate = sprintf("%.1f", d$post_mean),
+    N        = as.character(d$n_sample),
+    ESS      = sprintf("%.0f", d$ess_eff),
+    Estimate = sprintf("%.1f (%.1f to %.1f)", d$post_mean, d$ci_lo, d$ci_hi),
     p10      = sprintf("%.2f", d$p_top10),
     p20      = sprintf("%.2f", d$p_top20),
     p25      = sprintf("%.2f", d$p_top25),
     stringsAsFactors = FALSE, check.names = FALSE)
 }
 
-sus$patients <- sus$n            # patients over the window
-imp$patients <- imp$n1 + imp$n2  # patients over both halves
+sus$n_sample <- sus$n;           sus$ess_eff <- sus$n_eff            # window count / Kish ESS
+imp$n_sample <- imp$n1 + imp$n2;  imp$ess_eff <- imp$ess1 + imp$ess2  # both halves combined
 sus_tab <- top_table(sus)
 imp_tab <- top_table(imp)
 
-col_names <- c("Rank", "Hospital", "SiteCode", "Patients", "Estimate", "p10", "p20", "p25")
+col_names <- c("Rank", "ExpRank", "Hospital", "SiteCode", "N", "ESS", "Estimate", "p10", "p20", "p25")
 blank_row <- function(first_cell = "") {
   r <- as.data.frame(as.list(rep("", length(col_names))), stringsAsFactors = FALSE)
   names(r) <- col_names
@@ -104,13 +106,14 @@ group_row[["p10"]] <- "Probability in the top X% of performers"
 
 # the column titles; the estimate label differs between the two blocks
 titles_row <- function(est_label) {
-  r <- as.data.frame(as.list(c("Rank", "Hospital", "Site code", "Patients (n)",
+  r <- as.data.frame(as.list(c("Rank", "Expected rank", "Hospital", "Site code",
+                               "Sample size (N)", "Effective sample size (ESS)",
                                est_label, "10%", "20%", "25%")), stringsAsFactors = FALSE)
   names(r) <- col_names
   r
 }
-titles_sus <- titles_row("Standardised wait (days)")
-titles_imp <- titles_row("Change in wait (days)")
+titles_sus <- titles_row("Standardised mean waiting time (days)")
+titles_imp <- titles_row("Change in standardised mean waiting time (days)")
 
 sus_divider <- blank_row("Sustained performance (average waiting time, 2020-2021)")
 imp_divider <- blank_row("Improvement over the period (change, 2021 vs 2020)")
@@ -133,7 +136,7 @@ ft <- delete_part(ft, part = "header")   # every row above is already in the bod
 # merge the probability heading over its three columns, the blank left part of
 # the heading row, and each banner across the full width
 ft <- merge_at(ft, i = row_group,
-               j = match(c("Rank", "Hospital", "SiteCode", "Patients", "Estimate"), col_names),
+               j = match(c("Rank", "ExpRank", "Hospital", "SiteCode", "N", "ESS", "Estimate"), col_names),
                part = "body")
 ft <- merge_at(ft, i = row_group, j = match(c("p10", "p20", "p25"), col_names), part = "body")
 ft <- merge_at(ft, i = row_sus_div, j = seq_along(col_names), part = "body")
@@ -153,40 +156,57 @@ ft <- hline(ft, i = max(sus_rows), border = rule, part = "body")
 ft <- hline(ft, i = row_imp_div,   border = rule, part = "body")
 ft <- hline(ft, i = row_titles2,   border = rule, part = "body")
 
-# faint dotted rules separating identifiers, estimate and probabilities; only on
-# the title and data rows, so they do not cut through the merged heading / banners
+# very faint grey rules between individual hospitals, matching the movement table;
+# interior rows only, since each block's last row already has a black rule
+# (sustained) or the outer frame (improvement).
+faint <- fp_border(color = "grey85", width = 0.5)
+ft <- hline(ft, i = sus_rows[-length(sus_rows)], border = faint, part = "body")
+ft <- hline(ft, i = imp_rows[-length(imp_rows)], border = faint, part = "body")
+
+# faint dotted vertical rules bracketing the sample-size pair (N, ESS) and the
+# estimate column on their outer edges; only on the title and data rows, so they
+# do not cut through the merged heading / banners. Drawn on the right of each
+# named column: right of SiteCode = left of the pair, right of ESS = between the
+# pair and the estimate, right of Estimate = its right edge.
 vrule <- fp_border(color = "grey60", width = 0.75, style = "dotted")
-vcols <- match(c("Patients", "Estimate"), col_names)
+vcols <- match(c("ExpRank", "SiteCode", "ESS", "Estimate"), col_names)
 structured <- setdiff(seq_len(nrow(combined)), c(row_group, row_sus_div, row_imp_div))
 ft <- vline(ft, i = structured, j = vcols, border = vrule, part = "body")
 
-ft <- fontsize(ft, size = 9, part = "all")
+ft <- fontsize(ft, size = 7, part = "all")
 ft <- padding(ft, padding.top = 1, padding.bottom = 1, part = "all")
 
 ft <- autofit(ft)
-ft <- width(ft, j = "Rank", width = 0.45)
-ft <- width(ft, j = "Hospital", width = 1.75)
-ft <- width(ft, j = "SiteCode", width = 0.55)
-ft <- width(ft, j = "Patients", width = 0.6)
-ft <- width(ft, j = "Estimate", width = 1.0)
-ft <- width(ft, j = c("p10", "p20", "p25"), width = 0.5)
+ft <- width(ft, j = "Rank", width = 0.42)
+ft <- width(ft, j = "ExpRank", width = 0.62)
+ft <- width(ft, j = "Hospital", width = 1.7)
+ft <- width(ft, j = "SiteCode", width = 0.6)
+ft <- width(ft, j = "N", width = 0.5)
+ft <- width(ft, j = "ESS", width = 0.6)
+ft <- width(ft, j = "Estimate", width = 1.35)          # holds "mean (lo to hi)" on one line
+ft <- width(ft, j = c("p10", "p20", "p25"), width = 0.4)
 ft <- set_table_properties(ft, layout = "fixed", align = "left")
 
 caption_text <- paste(
-  "Top 20 hospitals by the shrinkage model: sustained (upper block) and",
-  "improvement (lower block). The estimate is the age- and comorbidity-",
-  "standardised waiting time from the Bayesian shrinkage model; the probabilities",
-  "are the posterior probability the hospital sits in the top X% of performers.")
+  "Top 20 hospitals by the shrinkage model, ordered by expected posterior rank:",
+  "sustained (upper block) and improvement (lower block). Rank is the position in",
+  "that ordering; Expected rank is the posterior mean rank (1 = fastest). The",
+  "estimate is the age- and comorbidity-standardised waiting time from the Bayesian",
+  "shrinkage model, with its 95% posterior credible interval in brackets; the",
+  "probabilities are the posterior probability the hospital sits in the top X% of",
+  "performers.")
 footnote_text <- paste(
   "For the improvement block the estimate is the change in standardised waiting",
   "time (a negative value = faster over the period) and 'top X%' means the most",
   "improved X% of hospitals.")
 
 doc <- read_docx()
-doc <- body_set_default_section(doc, prop_section(page_size = page_size(orient = "portrait")))
+doc <- body_set_default_section(doc, prop_section(
+  page_size = page_size(orient = "portrait"),
+  page_margins = page_mar(top = 0.7, bottom = 0.7, left = 0.6, right = 0.6)))
 doc <- body_add_par(doc, caption_text, style = "Normal")
 doc <- body_add_flextable(doc, ft)
-doc <- body_add_fpar(doc, fpar(ftext(footnote_text, prop = fp_text(font.size = 9))))
+doc <- body_add_fpar(doc, fpar(ftext(footnote_text, prop = fp_text(font.size = 8))))
 print(doc, target = file.path(out_dir, "top20_ranking.docx"))
 cat("top-20 ranking table saved.\n")
 

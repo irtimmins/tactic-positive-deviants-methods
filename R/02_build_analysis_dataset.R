@@ -38,19 +38,21 @@ w  <- reg %>% filter(diagmdy >= start_date, diagmdy <= end_date)
 np <- function(mask) n_distinct(w$pseudo_patientid[mask])
 
 # box 1: all colon adults in the window -------------------------------------
-fc_box(1, "All colon (C18) adults diagnosed in window", n_distinct(w$pseudo_patientid))
+fc_box(1, sprintf("All adult patients with colon cancer (C18) diagnosed between %s and %s",
+                  format(start_date, "%b %Y"), format(end_date, "%b %Y")),
+       n_distinct(w$pseudo_patientid))
 
 # box 2: stage 1-3 -----------------------------------------------------------
 m <- w$incl_stage13
 fc_excl(2, "Stage 4 / unknown / unstaged", np(m))
-fc_box(2, "Stage 1-3", np(m))
+fc_box(2, "Patients with Stage 1-3 colon cancer", np(m))
 
 # box 3: eligible incident colon cancer --------------------------------------
 m <- m & w$incl_elective_route; fc_excl(3, "Non-elective / unknown route to diagnosis", np(m))
 m <- m & w$incl_not_dco;        fc_excl(3, "Death-certificate-only diagnosis", np(m))
 m <- m & w$incl_not_diag_death; fc_excl(3, "Diagnosed at death", np(m))
 m <- m & w$is_first_primary;    fc_excl(3, "Not the first primary tumour", np(m))
-fc_box(3, "Eligible incident colon cancer", np(m))
+fc_box(3, "Patients with non-emergency routes to diagnosis", np(m))
 
 elig_ids <- unique(w$pseudo_patientid[m])
 
@@ -137,6 +139,15 @@ df <- df %>%
   )
 
 df <- df %>% mutate(across(c(imd_2, imd_3, imd_4, imd_5), ~ ifelse(is.na(.), 0L, .)))
+
+# NHS England region for representativeness checks. Registry geography fields
+# follow the <geo>_2024_name pattern (as canalliance does); take the first region
+# field present, else leave region blank (Table 1 then omits the region block).
+region_src <- intersect(c("nhser_2024_name", "nhs_england_region_2024_name",
+                          "region_2024_name", "nhser_name"), names(df))
+df$region <- if (length(region_src)) as.character(df[[region_src[1]]]) else NA_character_
+if (!length(region_src))
+  cat("no NHS region field found in the registry - set region_src in 02 if needed\n")
 
 cat("\nflowchart (boxes and exclusions):\n"); print(as.data.frame(flow))
 cat(sprintf("\nclinically eligible: %d patients, %d raw diagnosing codes\n",

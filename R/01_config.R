@@ -150,8 +150,11 @@ code_covariates <- function(d, age = age_coding, cci = cci_coding) {
 # patient mix. 0 = match as closely as possible (can reduce the effective sample
 # size sharply); larger = a gentler match that keeps more effective sample size.
 # lambda_main is the working value; lambda_grid is scanned to show the trade-off.
+# In this cohort the trade-off is nearly flat (relaxing lambda buys almost no
+# effective sample size), so a small penalty is used: it keeps near-complete
+# balance and only lightly regularises the weights for the smallest hospitals.
 lambda_grid <- c(0, .01, .05, .1, .25, .5, 1, 1.5, 2, 2.5, 3)
-lambda_main <- 0.05
+lambda_main <- 0.01
 
 # Bayesian shrinkage priors (in days) ----------------------------------------
 # prior_mu_sd: how far the overall average wait could plausibly sit from the data
@@ -412,8 +415,10 @@ standardise_change <- function(patient_data,
                              target_population     = earlier_half)$site
   
   earlier %>%
-    select(hosp, diag_hosp, mean_earlier = stand_adj, se_earlier = se_adj_pool, n1 = n) %>%
-    inner_join(later %>% select(hosp, mean_later = stand_adj, se_later = se_adj_pool, n2 = n),
+    select(hosp, diag_hosp, mean_earlier = stand_adj, se_earlier = se_adj_pool,
+           n1 = n, ess1 = n_eff) %>%
+    inner_join(later %>% select(hosp, mean_later = stand_adj, se_later = se_adj_pool,
+                                n2 = n, ess2 = n_eff),
                by = "hosp") %>%
     mutate(delta    = mean_later - mean_earlier,
            se_delta = sqrt(se_earlier^2 + se_later^2))
@@ -584,7 +589,10 @@ fix_names <- function(x) {
   gsub("Westminister", "Westminster", x)
 }
 
-strip_code_suffix <- function(x) trimws(sub("\\s*\\([^)]*\\)\\s*$", "", x))
+# drop any trailing parenthetical qualifier(s) from a display name - an alternate
+# code like "(RV820)" or a place tag like "(Bromley)", and a name carrying both.
+# Trailing only, so a legitimate mid-name bracket is left alone.
+strip_code_suffix <- function(x) trimws(sub("(\\s*\\([^)]*\\))+\\s*$", "", x))
 
 # named vector: canonical site code -> cleaned display name, from the diagnosing
 # crosswalk; NULL if the crosswalk is not present.
