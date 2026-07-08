@@ -32,26 +32,19 @@ balance_tradeoff <- function(d, cont, bin, grid = lambda_grid) {
   
   hosp_means <- rowsum(X, Z) / as.numeric(table(Z))    # hospital x covariate
   unw <- as.numeric(abs((hosp_means %*% beta)))
-  raw_n <- as.numeric(table(Z))
   
-  # one pass per lambda, keeping the whole per-hospital effective-n vector (not
-  # just its mean) so the spread across hospitals can be shown as well.
-  per <- lapply(grid, function(l) {
+  res <- t(sapply(grid, function(l) {
     so <- standardize(X, rep(0, ncol(X)), Z, lambda = l, exact_global = FALSE)
     w  <- extract_weights(so)
     wm <- (t(so$weights) %*% X)                        # hospital x covariate
     wt <- as.numeric(abs(wm %*% beta))
     ne <- tapply(w, Z, function(x) sum(x)^2 / sum(x^2))
-    list(summary = c(lambda       = l,
-                     bias_removed = 1 - mean(wt) / mean(unw),
-                     mean_eff_n   = mean(ne),
-                     mean_deff    = mean(ne / raw_n)),
-         ess = data.frame(lambda = l, hosp = names(ne),
-                          ess = as.numeric(ne), stringsAsFactors = FALSE))
-  })
-  list(summary = as.data.frame(do.call(rbind, lapply(per, `[[`, "summary"))),
-       ess     = do.call(rbind, lapply(per, `[[`, "ess")),
-       raw     = data.frame(hosp = names(table(Z)), n = raw_n, stringsAsFactors = FALSE))
+    c(lambda = l,
+      bias_removed = 1 - mean(wt) / mean(unw),
+      mean_eff_n   = mean(ne),
+      mean_deff    = mean(ne / as.numeric(table(Z))))
+  }))
+  as.data.frame(res)
 }
 
 # main analysis: primary standardisation (age + cci + season + calendar year) -
@@ -61,13 +54,19 @@ balance_tradeoff <- function(d, cont, bin, grid = lambda_grid) {
 # ethnicity, deprivation, stage) remain excluded.
 cv          <- code_covariates(df)
 primary_bin <- c(cv$bin, season_terms, year_term)
-to          <- balance_tradeoff(cv$data, cv$cont, primary_bin)
-trade       <- to$summary
-ess_by_hosp <- to$ess
-raw_by_hosp <- to$raw
+trade       <- balance_tradeoff(cv$data, cv$cont, primary_bin)
 cat("balance vs effective n by lambda:\n"); print(round(trade, 3))
-write.csv(trade,       file.path(out_dir, "lambda_tradeoff.csv"),        row.names = FALSE)
-write.csv(ess_by_hosp, file.path(out_dir, "lambda_ess_by_hospital.csv"), row.names = FALSE)
+write.csv(trade, file.path(out_dir, "lambda_tradeoff.csv"), row.names = FALSE)
+
+# main analysis fit at the working lambda; done before the figures because panel
+# (b) below shows this fit's per-hospital effective sample size.
+fit_main <- run_standardise(patient_data          = cv$data,
+                            continuous_covariates = cv$cont,
+                            binary_covariates     = primary_bin,
+                            lambda                = lambda_main)
+site_sustained <- fit_main$site
+saveRDS(fit_main,       file.path(out_dir, "fit_primary.rds"))
+saveRDS(site_sustained, file.path(out_dir, "site_sustained.rds"))
 
 # lambda trade-off figure. The weights shrink toward uniform as lambda grows: a
 # larger lambda keeps more effective sample size but removes less case-mix
@@ -77,26 +76,54 @@ write.csv(ess_by_hosp, file.path(out_dir, "lambda_ess_by_hospital.csv"), row.nam
 axis_title_size <- 13
 axis_text_size  <- 12
 label_size      <- 4.2
+tag_size        <- 15
+tag_x           <- 0      # a/b label horizontal position within each panel (0 = left)
+tag_y           <- 1.03   # a/b label vertical position; raise above 1 to nudge higher
+repel_spread_x  <- 2.5    # sideways fan for the crowded lambda labels (raise for more left/right)
+repel_lift_y    <- 4      # small upward lift so those labels clear their points
+near_nudge_x    <- 0.8    # small-lambda labels: slight rightward shift
+near_nudge_y    <- 6      # small-lambda labels: slight upward shift
+zero_lift_y     <- -1      # extra upward lift for the lambda = 0 label only
 
+# plotting window. anything with effective n outside this range is cropped rather
+# than trailing off the axis into the margin (clip is off for the labels and tag).
+x_lo <- 60
+x_hi <- 77
 trade_curve <- trade %>%
   mutate(pct_bias_removed = 100 * bias_removed,
          is_main = abs(lambda - lambda_main) < 1e-9)
-lab_near <- trade_curve[trade_curve$lambda <  2, ]   # already well spaced: plain labels
-lab_far  <- trade_curve[trade_curve$lambda >= 2, ]   # 2, 2.5, 3 bunch up: repel just these
+vis      <- trade_curve[trade_curve$mean_eff_n >= x_lo & trade_curve$mean_eff_n <= x_hi, ]
+lab_near <- vis[vis$lambda <  1, ]   # well spaced along the curve
+lab_far  <- vis[vis$lambda >= 1, ]   # 1 to 3 bunch up: let ggrepel place these
+# fan the crowded labels out sideways from their centre, so repulsion resolves
+# mostly left/right rather than stacking them vertically.
+lab_far$nudge_lr <- repel_spread_x * (lab_far$mean_eff_n - mean(lab_far$mean_eff_n))
+# lambda = 0 sits almost on top of 0.01, so repulsion keeps levelling the two; place
+# its label at a fixed height above instead (raise zero_lift_y to lift it further).
+lab_zero <- lab_near[lab_near$lambda == 0, ]
+lab_near <- lab_near[lab_near$lambda != 0, ]
 
-p_trade <- ggplot(trade_curve, aes(mean_eff_n, pct_bias_removed)) +
+p_trade <- ggplot(vis, aes(mean_eff_n, pct_bias_removed)) +
   geom_path(colour = "grey60", linewidth = 0.6) +
   geom_point(aes(colour = is_main, size = is_main)) +
-  geom_text(data = lab_near, aes(label = lambda), vjust = -0.9, size = label_size) +
+  geom_text_repel(data = lab_near, aes(label = lambda), size = label_size,
+                  nudge_x = near_nudge_x, nudge_y = near_nudge_y,
+                  direction = "both", force = 0.5, box.padding = 0.3,
+                  point.padding = 0.2, max.overlaps = Inf,
+                  segment.colour = "grey70", segment.size = 0.3, seed = 1) +
+  geom_text(data = lab_zero, aes(label = lambda), size = label_size,
+            nudge_x = near_nudge_x, nudge_y = near_nudge_y + zero_lift_y) +
   geom_text_repel(data = lab_far, aes(label = lambda), size = label_size,
-                  direction = "y", nudge_y = 6, box.padding = 0.4,
-                  min.segment.length = 0, segment.colour = "grey70",
-                  segment.size = 0.3, seed = 1) +
+                  nudge_x = lab_far$nudge_lr, nudge_y = repel_lift_y,
+                  direction = "both", box.padding = 0.6, point.padding = 0.4,
+                  force = 2, max.overlaps = Inf, min.segment.length = 0,
+                  segment.colour = "grey70", segment.size = 0.3, seed = 1) +
   scale_colour_manual(values = c(`FALSE` = "darkblue", `TRUE` = "firebrick"), guide = "none") +
   scale_size_manual(values = c(`FALSE` = 2.8, `TRUE` = 3.8), guide = "none") +
-  scale_x_continuous("Average effective sample size per hospital") +
+  scale_x_continuous("Average effective sample size per hospital",
+                     breaks = c(60, 65, 70, 75)) +
   scale_y_continuous("Average percentage bias reduction (%)", breaks = seq(0, 100, 20)) +
-  coord_cartesian(ylim = c(0, 100), clip = "off") +
+  coord_cartesian(xlim = c(x_lo, x_hi), ylim = c(0, 100), clip = "off") +
   theme_classic(base_size = 13) +
   theme(axis.title      = element_text(size = axis_title_size),
         axis.text       = element_text(size = axis_text_size),
@@ -108,50 +135,44 @@ ggsave(file.path(out_dir, "lambda_tradeoff.pdf"), p_trade,
        width = 120, height = 95, units = "mm", bg = "white")
 cat("lambda trade-off figure written to lambda_tradeoff.png / .pdf\n")
 
-# (b) spread of effective sample size across hospitals at each lambda, with the
-# raw per-hospital counts as a reference. Each violin is the distribution of
-# per-hospital effective n at one lambda (quartile lines inside); the grey box on
-# the right is the raw count the weights shrink from. Effective n sits below the
-# raw counts and climbs toward them as lambda grows. Same look as panel (a).
-lam_lev <- as.character(lambda_grid)
-ess_by_hosp$x <- factor(as.character(ess_by_hosp$lambda), levels = c(lam_lev, "Raw n"))
-raw_box <- data.frame(x = factor("Raw n", levels = c(lam_lev, "Raw n")),
-                      n = raw_by_hosp$n)
+# (b) overlap check at the working lambda: each hospital's effective sample size
+# after weighting against its raw sample size, point area proportional to the raw
+# count. Effective n can only sit at or below the raw count (dashed y = x line),
+# and falls further below it where a hospital's case-mix is further from the
+# reference. Same look as panel (a).
+nmax        <- max(site_sustained$n)
+size_breaks <- c(25, 50, 100, 200)
 
-p_ess <- ggplot() +
-  geom_hline(yintercept = median(raw_by_hosp$n), linetype = "dashed",
-             colour = "grey75", linewidth = 0.4) +
-  geom_violin(data = ess_by_hosp, aes(x, ess), fill = "darkblue", colour = "darkblue",
-              alpha = 0.25, linewidth = 0.4, scale = "width",
-              draw_quantiles = c(0.25, 0.5, 0.75)) +
-  geom_boxplot(data = raw_box, aes(x, n), width = 0.5, fill = "grey80",
-               colour = "grey30", linewidth = 0.4, outlier.size = 0.6) +
-  geom_vline(xintercept = length(lam_lev) + 0.5, linetype = "dotted", colour = "grey70") +
-  scale_x_discrete("Balancing weight regularisation, lambda") +
-  scale_y_continuous("Sample size per hospital",
-                     expand = expansion(mult = c(0.02, 0.05))) +
+p_scatter <- ggplot(site_sustained, aes(n, n_eff)) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed",
+              colour = "grey60", linewidth = 0.4) +
+  geom_point(aes(size = n), colour = "darkblue", alpha = 0.5) +
+  scale_size_area("Hospital sample size", max_size = 6, breaks = size_breaks) +
+  scale_x_continuous("Hospital sample size", limits = c(0, nmax),
+                     expand = expansion(mult = c(0, 0.04))) +
+  scale_y_continuous("Hospital effective sample size", limits = c(0, nmax),
+                     expand = expansion(mult = c(0, 0.04))) +
+  coord_fixed(ratio = 1) +                       # equal units both axes: y = x is a true 45 degrees
   theme_classic(base_size = 13) +
-  theme(axis.title  = element_text(size = axis_title_size),
-        axis.text   = element_text(size = axis_text_size),
-        axis.text.x = element_text(size = axis_text_size - 1),
-        legend.position = "none")
+  theme(axis.title           = element_text(size = axis_title_size),
+        axis.text            = element_text(size = axis_text_size),
+        legend.position      = c(0.03, 0.97),    # inside the empty upper-left corner
+        legend.justification = c(0, 1),
+        legend.background    = element_rect(fill = "white", colour = NA),
+        legend.key           = element_blank(),
+        legend.title         = element_text(size = axis_text_size - 1),
+        legend.text          = element_text(size = axis_text_size - 1))
 
-combined <- p_trade / p_ess +
+combined <- p_trade / p_scatter +
   plot_annotation(tag_levels = "a") &
-  theme(plot.tag = element_text(size = 15, face = "bold"))
+  theme(plot.tag          = element_text(size = tag_size, face = "bold"),
+        plot.tag.position = c(tag_x, tag_y),
+        plot.margin       = margin(t = 12, r = 6, b = 6, l = 6))
 ggsave(file.path(out_dir, "lambda_tradeoff_ess.png"), combined,
-       width = 150, height = 200, units = "mm", dpi = 600, bg = "white")
+       width = 125, height = 220, units = "mm", dpi = 600, bg = "white")
 ggsave(file.path(out_dir, "lambda_tradeoff_ess.pdf"), combined,
-       width = 150, height = 200, units = "mm", bg = "white")
+       width = 125, height = 220, units = "mm", bg = "white")
 cat("combined trade-off + effective-n figure written to lambda_tradeoff_ess.png / .pdf\n")
-
-fit_main <- run_standardise(patient_data          = cv$data,
-                            continuous_covariates = cv$cont,
-                            binary_covariates     = primary_bin,
-                            lambda                = lambda_main)
-site_sustained <- fit_main$site
-saveRDS(fit_main,       file.path(out_dir, "fit_primary.rds"))
-saveRDS(site_sustained, file.path(out_dir, "site_sustained.rds"))
 
 # improvement estimand -------------------------------------------------------
 # baseline period = first half of the window; later period = second half. Both
